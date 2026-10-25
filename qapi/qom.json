@@ -1085,6 +1085,21 @@
             '*tik': 'str' } }
 
 ##
+# @SevSnpEmuProperties:
+#
+# Properties for sev-snp-emu objects: a functional emulation of an AMD
+# SEV-SNP guest for the TCG accelerator (no encryption, no RMP, no
+# attestation).
+#
+# @policy: the guest policy (default: 0)
+#
+# Since: 11.1
+##
+{ 'struct': 'SevSnpEmuProperties',
+  'base': 'SevCommonProperties',
+  'data': { '*policy': 'uint64' } }
+
+##
 # @SevSnpGuestProperties:
 #
 # Properties for sev-snp-guest objects.  Most of these are direct
@@ -1330,6 +1345,7 @@
       'if': 'CONFIG_SECRET_KEYRING' },
     'sev-emu',
     'sev-guest',
+    'sev-snp-emu',
     'sev-snp-guest',
     'thread-context',
     's390-pv-guest',
@@ -1410,6 +1426,7 @@
                                       'if': 'CONFIG_SECRET_KEYRING' },
       'sev-emu':                    'SevEmuProperties',
       'sev-guest':                  'SevGuestProperties',
+      'sev-snp-emu':                'SevSnpEmuProperties',
       'sev-snp-guest':              'SevSnpGuestProperties',
       'tdx-guest':                  'TdxGuestProperties',
       'thread-context':             'ThreadContextProperties',

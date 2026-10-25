@@ -26,6 +26,8 @@
 #define sev_snp_enabled() 0
 #define sev_emu_enabled() 0
 #define sev_es_emu_active() 0
+#define sev_snp_emu_active() 0
+#define sev_emu_pte_cbit(pte) 0
 #else
 bool sev_enabled(void);
 bool sev_es_enabled(void);
@@ -33,9 +35,47 @@ bool sev_snp_enabled(void);
 bool sev_emu_enabled(void);
 /* the #VC/GHCB emulation of sev-emu is on (SEV-ES policy or SEV-SNP) */
 extern bool sev_emu_es_flag;
+extern bool sev_emu_snp_flag;
+extern uint64_t sev_emu_cbit_mask;
 static inline bool sev_es_emu_active(void)
 {
     return sev_emu_es_flag;
+}
+static inline bool sev_snp_emu_active(void)
+{
+    return sev_emu_snp_flag;
+}
+/* the C-bit of a raw page-table entry of an emulated guest (0 otherwise) */
+static inline uint64_t sev_emu_pte_cbit(uint64_t pte)
+{
+    return pte & sev_emu_cbit_mask;
+}
+
+/*
+ * The page states of the emulated SEV-SNP guest, one byte per 4K guest page:
+ * what the RMP would say about the page (private to the guest or shared with
+ * the hypervisor, validated by the guest, holding a VMSA).
+ */
+#define SNP_PAGE_PRIVATE    0x01
+#define SNP_PAGE_VALIDATED  0x02
+#define SNP_PAGE_VMSA       0x04
+#define SNP_PAGE_NONE       0xff    /* not guest RAM */
+extern uint8_t *sev_snp_emu_pages;
+extern uint64_t sev_snp_emu_page_count;
+static inline uint8_t sev_snp_emu_page_state(hwaddr gpa)
+{
+    uint64_t pfn = gpa >> 12;
+
+    return pfn < sev_snp_emu_page_count ? qatomic_read(&sev_snp_emu_pages[pfn])
+                                        : SNP_PAGE_NONE;
+}
+static inline void sev_snp_emu_page_set(hwaddr gpa, uint8_t state)
+{
+    uint64_t pfn = gpa >> 12;
+
+    if (pfn < sev_snp_emu_page_count) {
+        qatomic_set(&sev_snp_emu_pages[pfn], state);
+    }
 }
 uint64_t sev_emu_sev_status(void);
 uint64_t sev_emu_hv_features(void);
@@ -49,6 +89,7 @@ bool sev_emu_ap_sipi(CPUState *cpu);
 
 #define TYPE_SEV_COMMON "sev-common"
 #define TYPE_SEV_EMU "sev-emu"
+#define TYPE_SEV_SNP_EMU "sev-snp-emu"
 #define TYPE_SEV_GUEST "sev-guest"
 #define TYPE_SEV_SNP_GUEST "sev-snp-guest"
 

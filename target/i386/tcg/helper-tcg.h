@@ -70,6 +70,8 @@ G_NORETURN void raise_exception_err(CPUX86State *env, int exception_index,
 G_NORETURN void sev_emu_raise_vc(CPUX86State *env, uint32_t exit_code,
                                  uintptr_t retaddr);
 bool sev_emu_msr_passthrough(uint32_t index);
+/* system/excp_helper.c: a page walk for PVALIDATE and RMPADJUST */
+bool sev_snp_emu_translate(CPUX86State *env, vaddr addr, hwaddr *paddr);
 /* system/misc_helper.c: MSR access without exceptions (false: #GP) */
 bool x86_rdmsr_core(CPUX86State *env, uint32_t index, uint64_t *pval);
 bool x86_wrmsr_core(CPUX86State *env, uint32_t index, uint64_t val);

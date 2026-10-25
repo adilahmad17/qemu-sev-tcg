@@ -32,6 +32,7 @@
 #include "sev.h"
 #include "sev-emu.h"
 #include "qemu/log.h"
+#include "qemu/units.h"
 #include "system/address-spaces.h"
 #include "system/cpus.h"
 #include "system/system.h"
@@ -57,6 +58,7 @@
 OBJECT_DECLARE_TYPE(SevCommonState, SevCommonStateClass, SEV_COMMON)
 OBJECT_DECLARE_TYPE(SevGuestState, SevCommonStateClass, SEV_GUEST)
 OBJECT_DECLARE_TYPE(SevEmuState, SevCommonStateClass, SEV_EMU)
+OBJECT_DECLARE_TYPE(SevSnpEmuState, SevCommonStateClass, SEV_SNP_EMU)
 OBJECT_DECLARE_TYPE(SevSnpGuestState, SevCommonStateClass, SEV_SNP_GUEST)
 
 /* hard code sha256 digest size */
@@ -215,6 +217,20 @@ typedef struct SevEmuState {
     uint8_t *tik;
     QEMUIOVector ld_data;
 } SevEmuState;
+
+/*
+ * SevSnpEmuState:
+ *
+ * The emulated SEV-SNP guest of QEMU TCG (sev-snp-emu): sev-emu with the
+ * SEV-ES machinery plus what the guest sees of SNP: PVALIDATE, RMPADJUST,
+ * page-state changes, the CPUID and secrets pages, AP creation. No RMP,
+ * no attestation: guest requests fail.
+ */
+typedef struct SevSnpEmuState {
+    SevCommonState parent_obj;
+
+    uint64_t policy;
+} SevSnpEmuState;
 
 struct SevSnpGuestState {
     SevCommonState parent_obj;
@@ -737,9 +753,10 @@ static int sev_set_cpu_context(uint16_t cpu_index, const void *ctx,
 bool
 sev_emu_enabled(void)
 {
-   ConfidentialGuestSupport *cgs = MACHINE(qdev_get_machine())->cgs;
+    ConfidentialGuestSupport *cgs = MACHINE(qdev_get_machine())->cgs;
 
-   return !!object_dynamic_cast(OBJECT(cgs), TYPE_SEV_EMU);
+    return object_dynamic_cast(OBJECT(cgs), TYPE_SEV_EMU) ||
+           object_dynamic_cast(OBJECT(cgs), TYPE_SEV_SNP_EMU);
 }
 
 bool
@@ -755,7 +772,8 @@ sev_snp_enabled(void)
 {
     ConfidentialGuestSupport *cgs = MACHINE(qdev_get_machine())->cgs;
 
-    return !!object_dynamic_cast(OBJECT(cgs), TYPE_SEV_SNP_GUEST);
+    return object_dynamic_cast(OBJECT(cgs), TYPE_SEV_SNP_GUEST) ||
+           object_dynamic_cast(OBJECT(cgs), TYPE_SEV_SNP_EMU);
 }
 
 bool
@@ -766,7 +784,7 @@ sev_es_enabled(void)
     if (sev_snp_enabled()) {
         return true;
     }
-    if (sev_emu_enabled()) {
+    if (object_dynamic_cast(OBJECT(cgs), TYPE_SEV_EMU)) {
         return SEV_EMU(cgs)->policy & SEV_POLICY_ES;
     }
     return sev_enabled() && SEV_GUEST(cgs)->policy & SEV_POLICY_ES;
@@ -789,6 +807,165 @@ sev_get_reduced_phys_bits(void)
 }
 
 bool sev_emu_es_flag;
+bool sev_emu_snp_flag;
+uint64_t sev_emu_cbit_mask;
+uint8_t *sev_snp_emu_pages;
+uint64_t sev_snp_emu_page_count;
+
+/* every 4K page of [gpa, gpa + len) gets `state` */
+static void sev_snp_emu_pages_set(hwaddr gpa, uint64_t len, uint8_t state)
+{
+    hwaddr end = QEMU_ALIGN_UP(gpa + len, 4096);
+
+    for (gpa &= ~0xfffULL; gpa < end; gpa += 4096) {
+        sev_snp_emu_page_set(gpa, state);
+    }
+}
+
+/* the CPUID page of the SNP firmware ABI, from the CPU model of the machine */
+static int sev_snp_emu_set_cpuid(hwaddr gpa, uint8_t *hva, size_t len,
+                                 Error **errp)
+{
+    CPUX86State *env = &X86_CPU(first_cpu)->env;
+    SnpCpuidInfo *info = g_new0(SnpCpuidInfo, 1);
+    uint32_t leaf, sub, n = 0, eax, ebx, ecx, edx;
+    uint32_t xlevel = MAX(env->cpuid_xlevel, 0x8000001f);
+
+    /* returns false when the page is full */
+#define SNP_CPUID_ADD(l, c) \
+    ({ \
+        bool ok = n < SNP_CPUID_FUNCTION_MAXCOUNT; \
+        if (ok) { \
+            SnpCpuidFunc *fn = &info->entries[n]; \
+            cpu_x86_cpuid(env, (l), (c), &eax, &ebx, &ecx, &edx); \
+            fn->eax_in = (l); \
+            fn->ecx_in = (c); \
+            fn->eax = eax; \
+            fn->ebx = ebx; \
+            fn->ecx = ecx; \
+            fn->edx = edx; \
+            if (eax | ebx | ecx | edx) { \
+                n++; \
+            } else { \
+                memset(fn, 0, sizeof(*fn)); \
+            } \
+        } \
+        ok; \
+    })
+
+    if (len < sizeof(*info)) {
+        error_setg(errp, "%s: CPUID page too small", __func__);
+        g_free(info);
+        return -1;
+    }
+    for (leaf = 0; leaf <= MIN(env->cpuid_level, 0x1f); leaf++) {
+        switch (leaf) {
+        case 4:
+        case 0x8000001d:
+            for (sub = 0; sub < 8; sub++) {
+                cpu_x86_cpuid(env, leaf, sub, &eax, &ebx, &ecx, &edx);
+                if (!(eax & 0x1f)) {
+                    break;
+                }
+                SNP_CPUID_ADD(leaf, sub);
+            }
+            break;
+        case 7:
+            cpu_x86_cpuid(env, 7, 0, &eax, &ebx, &ecx, &edx);
+            for (sub = 0; sub <= MIN(eax, 2); sub++) {
+                SNP_CPUID_ADD(7, sub);
+            }
+            break;
+        case 0xb:
+            for (sub = 0; sub < 3; sub++) {
+                cpu_x86_cpuid(env, leaf, sub, &eax, &ebx, &ecx, &edx);
+                if (sub && !(ecx >> 8 & 0xff)) {
+                    break;
+                }
+                SNP_CPUID_ADD(leaf, sub);
+            }
+            break;
+        case 0xd: {
+            uint64_t features;
+
+            cpu_x86_cpuid(env, 0xd, 0, &eax, &ebx, &ecx, &edx);
+            features = eax | ((uint64_t)edx << 32);
+            cpu_x86_cpuid(env, 0xd, 1, &eax, &ebx, &ecx, &edx);
+            features |= ecx | ((uint64_t)edx << 32);
+            for (sub = 0; sub < 64; sub++) {
+                if (sub >= 2 && !(features & (1ULL << sub))) {
+                    continue;
+                }
+                if (SNP_CPUID_ADD(0xd, sub) && sub <= 1 && n &&
+                    info->entries[n - 1].ecx_in == sub &&
+                    info->entries[n - 1].eax_in == 0xd) {
+                    /*
+                     * Guests compute EBX from the XSAVE components; the
+                     * firmware records the size of the initial XCR0 = 1.
+                     */
+                    info->entries[n - 1].ebx = 0x240;
+                    info->entries[n - 1].xcr0_in = 1;
+                }
+            }
+            break;
+        }
+        default:
+            SNP_CPUID_ADD(leaf, 0);
+            break;
+        }
+    }
+    for (leaf = 0x80000000; leaf <= xlevel; leaf++) {
+        if (leaf == 0x8000001d) {
+            for (sub = 0; sub < 8; sub++) {
+                cpu_x86_cpuid(env, leaf, sub, &eax, &ebx, &ecx, &edx);
+                if (!(eax & 0x1f)) {
+                    break;
+                }
+                SNP_CPUID_ADD(leaf, sub);
+            }
+        } else if (leaf == 0x8000001f) {
+            if (n < SNP_CPUID_FUNCTION_MAXCOUNT) {
+                SnpCpuidFunc *fn = &info->entries[n++];
+
+                fn->eax_in = leaf;
+                fn->eax = 0x1a;     /* SEV, SEV-ES, SEV-SNP */
+                fn->ebx = (sev_get_cbit_position() & 0x3f) |
+                          (sev_get_reduced_phys_bits() & 0x3f) << 6;
+            }
+        } else {
+            SNP_CPUID_ADD(leaf, 0);
+        }
+    }
+#undef SNP_CPUID_ADD
+    if (n >= SNP_CPUID_FUNCTION_MAXCOUNT) {
+        warn_report("sev-snp-emu: the CPUID page is full, leaves are missing");
+    }
+    info->count = n;
+    memcpy(hva, info, sizeof(*info));
+    g_free(info);
+    sev_snp_emu_pages_set(gpa, len, SNP_PAGE_PRIVATE | SNP_PAGE_VALIDATED);
+    return 0;
+}
+
+/*
+ * The secrets page: version 3 of the SNP firmware ABI layout, random VMPCKs
+ * (nothing verifies the guest's messages here) and a zero OS area.
+ */
+static int sev_snp_emu_set_secrets(hwaddr gpa, uint8_t *hva, size_t len,
+                                   Error **errp)
+{
+    if (len < 4096) {
+        error_setg(errp, "%s: secrets page too small", __func__);
+        return -1;
+    }
+    memset(hva, 0, 4096);
+    stl_le_p(hva, 3);                               /* version */
+    if (qcrypto_random_bytes(hva + 0x20, 4 * 32, errp) < 0) {   /* VMPCK0-3 */
+        return -1;
+    }
+    sev_snp_emu_pages_set(gpa, len, SNP_PAGE_PRIVATE | SNP_PAGE_VALIDATED);
+    return 0;
+}
 
 /* the SEV_STATUS MSR of the emulated guest */
 uint64_t sev_emu_sev_status(void)
@@ -863,6 +1040,12 @@ int sev_emu_ap_creation(uint32_t request, uint32_t apic_id, hwaddr vmsa_gpa,
         /* a page, and (as KVM requires) not 2 MB aligned */
         qemu_log_mask(LOG_GUEST_ERROR, "sev-emu: invalid AP VMSA address 0x%"
                       HWADDR_PRIx "\n", vmsa_gpa);
+        return -1;
+    }
+    if (sev_snp_enabled() &&
+        !(sev_snp_emu_page_state(vmsa_gpa) & SNP_PAGE_VMSA)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "sev-emu: the AP VMSA page 0x%"
+                      HWADDR_PRIx " was not marked with RMPADJUST\n", vmsa_gpa);
         return -1;
     }
     vmsa = g_malloc(4096);
@@ -1701,7 +1884,7 @@ static char *sev_get_launch_measurement(void)
         SEV_COMMON(sev_guest)->state >= SEV_STATE_LAUNCH_SECRET) {
         return g_strdup(sev_guest->measurement);
     }
-    if (sev_emu_enabled() &&
+    if (object_dynamic_cast(OBJECT(cgs), TYPE_SEV_EMU) &&
         SEV_COMMON(cgs)->state >= SEV_STATE_LAUNCH_SECRET) {
         return g_strdup(SEV_EMU(cgs)->measurement);
     }
@@ -2943,6 +3126,13 @@ static int cgs_set_guest_state(hwaddr gpa, uint8_t *ptr, uint64_t len,
         return sev_set_cpu_context(cpu_index, ptr, len, gpa, errp);
 
     case CGS_PAGE_TYPE_UNMEASURED:
+        if (sev_emu_enabled()) {
+            if (sev_snp_enabled()) {
+                sev_snp_emu_pages_set(gpa, len,
+                                      SNP_PAGE_PRIVATE | SNP_PAGE_VALIDATED);
+            }
+            return 0;
+        }
         if (sev_snp_enabled()) {
             return snp_launch_update_data(
                 gpa, ptr, len, KVM_SEV_SNP_PAGE_TYPE_UNMEASURED, errp);
@@ -2951,6 +3141,9 @@ static int cgs_set_guest_state(hwaddr gpa, uint8_t *ptr, uint64_t len,
         return 0;
 
     case CGS_PAGE_TYPE_SECRETS:
+        if (sev_snp_enabled() && sev_emu_enabled()) {
+            return sev_snp_emu_set_secrets(gpa, ptr, len, errp);
+        }
         if (!sev_snp_enabled()) {
             error_setg(errp,
                        "%s: attempt to configure secrets page, but SEV-SNP "
@@ -2976,6 +3169,9 @@ static int cgs_set_guest_state(hwaddr gpa, uint8_t *ptr, uint64_t len,
         return 0;
 
     case CGS_PAGE_TYPE_CPUID:
+        if (sev_snp_enabled() && sev_emu_enabled()) {
+            return sev_snp_emu_set_cpuid(gpa, ptr, len, errp);
+        }
         if (!sev_snp_enabled()) {
             error_setg(errp,
                        "%s: attempt to configure CPUID page, but SEV-SNP "
@@ -3044,6 +3240,17 @@ static int cgs_set_guest_policy(ConfidentialGuestPolicyType policy_type,
         error_setg(errp, "%s: Invalid guest policy type provided for SEV: %d",
         __func__, policy_type);
         return -1;
+    }
+    if (sev_emu_enabled()) {
+        /* the emulated guests record the policy; there is no ID block to check */
+        Object *obj = OBJECT(MACHINE(qdev_get_machine())->cgs);
+
+        if (sev_snp_enabled()) {
+            SEV_SNP_EMU(obj)->policy = policy;
+        } else {
+            SEV_EMU(obj)->policy = policy;
+        }
+        return 0;
     }
     /*
      * SEV-SNP handles policy differently. The policy flags are defined in
@@ -3297,7 +3504,8 @@ sev_guest_instance_init(Object *obj)
 static int sev_emu_init(ConfidentialGuestSupport *cgs, Error **errp)
 {
     SevCommonState *sev_common = SEV_COMMON(cgs);
-    SevEmuState *sev_emu = SEV_EMU(sev_common);
+    SevEmuState *sev_emu = (SevEmuState *)
+        object_dynamic_cast(OBJECT(cgs), TYPE_SEV_EMU);
     MachineState *machine = MACHINE(qdev_get_machine());
     X86MachineState *x86machine = X86_MACHINE(machine);
 
@@ -3310,8 +3518,21 @@ static int sev_emu_init(ConfidentialGuestSupport *cgs, Error **errp)
     sev_common->state = SEV_STATE_UNINIT;
     /* what the emulated firmware accepts in a VMSA's sev_features */
     sev_common->supported_sev_features = SVM_SEV_FEAT_SNP_ACTIVE;
-    /* #VC and GHCB emulation from now on (the TCG helpers read this flag) */
+    /* #VC and GHCB emulation from now on (the TCG helpers read these) */
     sev_emu_es_flag = sev_es_enabled();
+    sev_emu_snp_flag = sev_snp_enabled();
+    sev_emu_cbit_mask = 1ULL << sev_common->cbitpos;
+    if (sev_emu_snp_flag) {
+        /*
+         * One state byte per page of the guest-physical space that holds
+         * RAM (the RAM above 4 GB is remapped behind the 4 GB hole): all of
+         * it is private and unvalidated until the launch or the guest says
+         * otherwise, as the RMP of a fresh SNP guest.
+         */
+        sev_snp_emu_page_count = (machine->ram_size + (4 * GiB)) >> 12;
+        sev_snp_emu_pages = g_malloc(sev_snp_emu_page_count);
+        memset(sev_snp_emu_pages, SNP_PAGE_PRIVATE, sev_snp_emu_page_count);
+    }
 
     /*
      * The cbitpos value will be placed in bit positions 5:0 of the EBX
@@ -3361,14 +3582,16 @@ static int sev_emu_init(ConfidentialGuestSupport *cgs, Error **errp)
     sev_common->api_major = FAKE_API_MAJOR;
     sev_common->api_minor = FAKE_API_MINOR;
 
-    /* Initialize the iovec for the measurements blobs */
-    qemu_iovec_init(&sev_emu->ld_data, 3);
+    /* Initialize the iovec for the measurements blobs (plain SEV) */
+    if (sev_emu) {
+        qemu_iovec_init(&sev_emu->ld_data, 3);
+    }
 
     qemu_add_vm_change_state_handler(sev_vm_state_change, sev_common);
 
     cgs->ready = true;
 
-    if (!x86machine->igvm) {
+    if (sev_emu && !x86machine->igvm) {
         qemu_add_machine_init_done_notifier(&sev_emu_machine_done_notify);
     }
 
@@ -3378,12 +3601,15 @@ static int sev_emu_init(ConfidentialGuestSupport *cgs, Error **errp)
 static int sev_emu_launch_update_data(SevCommonState *sev_common,
         hwaddr gpa, uint8_t *addr, size_t len, Error **errp)
 {
-    SevEmuState *sev_emu = SEV_EMU(sev_common);
-
     if (!addr || !len) {
         return 1;
     }
-    qemu_iovec_add(&sev_emu->ld_data, addr, len);
+    if (sev_snp_enabled()) {
+        /* launched pages are private and validated */
+        sev_snp_emu_pages_set(gpa, len, SNP_PAGE_PRIVATE | SNP_PAGE_VALIDATED);
+        return 0;
+    }
+    qemu_iovec_add(&SEV_EMU(sev_common)->ld_data, addr, len);
 
     return 0;
 }
@@ -3503,6 +3729,35 @@ static const TypeInfo sev_guest_info = {
 };
 
 /* emulated sev */
+static void sev_snp_emu_instance_init(Object *obj)
+{
+    SevSnpEmuState *sev_snp_emu = SEV_SNP_EMU(obj);
+
+    object_property_add_uint64_ptr(obj, "policy", &sev_snp_emu->policy,
+                                   OBJ_PROP_FLAG_READWRITE);
+}
+
+static void sev_snp_emu_class_init(ObjectClass *oc, const void *data)
+{
+    SevCommonStateClass *scc = SEV_COMMON_CLASS(oc);
+    ConfidentialGuestSupportClass *klass = CONFIDENTIAL_GUEST_SUPPORT_CLASS(oc);
+    X86ConfidentialGuestClass *x86_klass = X86_CONFIDENTIAL_GUEST_CLASS(oc);
+
+    klass->kvm_init = sev_emu_init;
+    x86_klass->kvm_type = sev_emu_kvm_type;
+    scc->launch_update_data = sev_emu_launch_update_data;
+    scc->launch_finish = sev_emu_launch_finish;
+}
+
+/* emulated sev-snp */
+static const TypeInfo sev_snp_emu_info = {
+    .parent = TYPE_SEV_COMMON,
+    .name = TYPE_SEV_SNP_EMU,
+    .instance_size = sizeof(SevSnpEmuState),
+    .instance_init = sev_snp_emu_instance_init,
+    .class_init = sev_snp_emu_class_init
+};
+
 static const TypeInfo sev_emu_info = {
     .parent = TYPE_SEV_COMMON,
     .name = TYPE_SEV_EMU,
@@ -3789,6 +4044,7 @@ sev_register_types(void)
 {
     type_register_static(&sev_common_info);
     type_register_static(&sev_emu_info);
+    type_register_static(&sev_snp_emu_info);
     type_register_static(&sev_guest_info);
     type_register_static(&sev_snp_guest_info);
 }

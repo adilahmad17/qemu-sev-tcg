@@ -140,6 +140,11 @@ static inline bool ptw_setl(const PTETranslate *in, uint32_t old, uint32_t set)
     return true;
 }
 
+#ifdef CONFIG_SEV
+/* set while PVALIDATE/RMPADJUST translate their operand (no validation check) */
+static __thread bool sev_snp_translate_only;
+#endif
+
 static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
                           TranslateResult *out, TranslateFault *err,
                           uint64_t ra)
@@ -159,6 +164,9 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
     int page_size;
     int error_code;
     int prot;
+#ifdef CONFIG_SEV
+    uint64_t pte_cbit = 0;  /* the C-bit of the leaf entry */
+#endif
 
  restart_all:
 #ifdef CONFIG_SEV
@@ -187,6 +195,7 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
             restart_5:
                 pte = ptw_ldq(&pte_trans, ra);
             #ifdef CONFIG_SEV
+                pte_cbit = sev_emu_pte_cbit(pte);
                 pte = sev_emu_convert_pte(pte);
             #endif
                 if (!(pte & PG_PRESENT_MASK)) {
@@ -214,6 +223,7 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
         restart_4:
             pte = ptw_ldq(&pte_trans, ra);
         #ifdef CONFIG_SEV
+            pte_cbit = sev_emu_pte_cbit(pte);
             pte = sev_emu_convert_pte(pte);
         #endif
             if (!(pte & PG_PRESENT_MASK)) {
@@ -237,6 +247,7 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
         restart_3_lma:
             pte = ptw_ldq(&pte_trans, ra);
         #ifdef CONFIG_SEV
+            pte_cbit = sev_emu_pte_cbit(pte);
             pte = sev_emu_convert_pte(pte);
         #endif
             if (!(pte & PG_PRESENT_MASK)) {
@@ -268,6 +279,7 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
         restart_3_nolma:
             pte = ptw_ldq(&pte_trans, ra);
         #ifdef CONFIG_SEV
+            pte_cbit = sev_emu_pte_cbit(pte);
             pte = sev_emu_convert_pte(pte);
         #endif
             if (!(pte & PG_PRESENT_MASK)) {
@@ -292,6 +304,7 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
     restart_2_pae:
         pte = ptw_ldq(&pte_trans, ra);
     #ifdef CONFIG_SEV
+        pte_cbit = sev_emu_pte_cbit(pte);
         pte = sev_emu_convert_pte(pte);
     #endif
         if (!(pte & PG_PRESENT_MASK)) {
@@ -320,6 +333,7 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
         }
         pte = ptw_ldq(&pte_trans, ra);
     #ifdef CONFIG_SEV
+        pte_cbit = sev_emu_pte_cbit(pte);
         pte = sev_emu_convert_pte(pte);
     #endif
         if (!(pte & PG_PRESENT_MASK)) {
@@ -342,6 +356,7 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
     restart_2_nopae:
         pte = ptw_ldl(&pte_trans, ra);
     #ifdef CONFIG_SEV
+        pte_cbit = sev_emu_pte_cbit(pte);
         pte = sev_emu_convert_pte(pte);
     #endif
         if (!(pte & PG_PRESENT_MASK)) {
@@ -373,6 +388,7 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
         }
         pte = ptw_ldl(&pte_trans, ra);
     #ifdef CONFIG_SEV
+        pte_cbit = sev_emu_pte_cbit(pte);
         pte = sev_emu_convert_pte(pte);
     #endif
         if (!(pte & PG_PRESENT_MASK)) {
@@ -468,6 +484,25 @@ do_check_protect_pse36:
 
     /* merge offset within page */
     paddr = (pte & PG_ADDRESS_MASK & ~(page_size - 1)) | (addr & (page_size - 1));
+#ifdef CONFIG_SEV
+    if (pte_cbit && sev_snp_emu_active() && !sev_snp_translate_only) {
+        /*
+         * An emulated SEV-SNP guest: a private page the guest has not
+         * validated raises #VC with the "page not validated" exit code and
+         * the address in CR2; nothing is installed in the TLB.
+         */
+        uint8_t state = sev_snp_emu_page_state(paddr);
+
+        if (state != SNP_PAGE_NONE && !(state & SNP_PAGE_VALIDATED)) {
+            *err = (TranslateFault){
+                .exception_index = EXCP1D_VC,
+                .error_code = SVM_EXIT_PAGE_NOT_VALIDATED,
+                .cr2 = addr,
+            };
+            return false;
+        }
+    }
+#endif
  stage2:
 
     /*
@@ -691,3 +726,26 @@ G_NORETURN void x86_cpu_do_unaligned_access(CPUState *cs, vaddr vaddr,
     X86CPU *cpu = X86_CPU(cs);
     handle_unaligned_access(&cpu->env, vaddr, access_type, retaddr);
 }
+
+#ifdef CONFIG_SEV
+/*
+ * The guest-physical address of `addr` for the SEV-SNP page instructions:
+ * the page walk of a data read at the current privilege level, without
+ * the validation check (an unvalidated page is what they operate on).
+ */
+bool sev_snp_emu_translate(CPUX86State *env, vaddr addr, hwaddr *paddr)
+{
+    TranslateResult out;
+    TranslateFault err;
+    bool ok;
+
+    sev_snp_translate_only = true;
+    ok = get_physical_address(env, addr, MMU_DATA_LOAD,
+                              cpu_mmu_index(env_cpu(env), false), &out, &err, 0);
+    sev_snp_translate_only = false;
+    if (ok) {
+        *paddr = out.paddr;
+    }
+    return ok;
+}
+#endif

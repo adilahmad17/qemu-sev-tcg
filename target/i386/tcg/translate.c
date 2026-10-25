@@ -2963,6 +2963,38 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
             s->base.is_jmp = DISAS_NORETURN;
             break;
 
+#if defined(CONFIG_SEV) && !defined(CONFIG_USER_ONLY)
+        case 0xfe: /* RMPADJUST */
+        case 0xff: /* PVALIDATE */
+            if (!sev_snp_emu_active() || !CODE64(s) ||
+                !(s->prefix & (modrm == 0xff ? PREFIX_REPNZ : PREFIX_REPZ))) {
+                goto illegal_op;
+            }
+            if (!check_cpl0(s)) {
+                break;
+            }
+            gen_update_cc_op(s);
+            gen_update_eip_cur(s);
+            if (modrm == 0xff) {
+                /* EAX = result, CF = "no change"; the other flags are cleared */
+                TCGv_i64 res = tcg_temp_new_i64();
+                TCGv_i32 cf = tcg_temp_new_i32();
+
+                gen_helper_sev_pvalidate(res, tcg_env, cpu_regs[R_EAX],
+                                         cpu_regs[R_ECX], cpu_regs[R_EDX]);
+                tcg_gen_extrh_i64_i32(cf, res);
+                tcg_gen_trunc_i64_tl(cpu_regs[R_EAX], res);
+                tcg_gen_ext32u_tl(cpu_regs[R_EAX], cpu_regs[R_EAX]);
+                tcg_gen_extu_i32_tl(cpu_cc_src, cf);
+                set_cc_op(s, CC_OP_EFLAGS);
+            } else {
+                gen_helper_sev_rmpadjust(cpu_regs[R_EAX], tcg_env,
+                                         cpu_regs[R_EAX], cpu_regs[R_ECX],
+                                         cpu_regs[R_EDX]);
+            }
+            s->base.is_jmp = DISAS_EOB_NEXT;
+            break;
+#endif
         case 0xd9: /* VMMCALL */
             if (!SVME(s)) {
                 goto illegal_op;

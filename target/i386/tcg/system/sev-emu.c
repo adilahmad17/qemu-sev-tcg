@@ -12,9 +12,12 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/error-report.h"
+#include "qemu/units.h"
 #include "cpu.h"
 #include "exec/helper-proto.h"
 #include "accel/tcg/cpu-loop.h"
+#include "exec/cputlb.h"
+#include "accel/tcg/cpu-mmu-index.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
 #include "system/runstate.h"
@@ -67,6 +70,14 @@ bool sev_emu_msr_passthrough(uint32_t index)
     }
 }
 
+#define SNP_GUEST_FW_ERR_GENERIC    1
+
+static int sev_snp_emu_psc(CPUX86State *env, hwaddr gpa, unsigned op,
+                           bool huge);
+static void sev_emu_nae_psc(CPUX86State *env, hwaddr ghcb_gpa, GhcbPage *ghcb);
+static bool ghcb_scratch(hwaddr ghcb_gpa, GhcbPage *ghcb, unsigned size,
+                         void *buf, bool to_guest);
+
 /* ---- the GHCB page in guest memory ---- */
 
 static void ghcb_read(hwaddr gpa, GhcbPage *ghcb)
@@ -111,6 +122,184 @@ static G_NORETURN void sev_emu_halt(CPUX86State *env, int next_eip_addend)
     cs->halted = 1;
     cs->exception_index = EXCP_HLT;
     cpu_loop_exit(cs);
+}
+
+/* ---- SEV-SNP: page states ---- */
+
+/* the RMP operations of the GHCB page-state change interface */
+#define SNP_PSC_OP_PRIVATE  1
+#define SNP_PSC_OP_SHARED   2
+#define SNP_PSC_ERR_INVALID_HDR     1
+#define SNP_PSC_ERR_INVALID_ENTRY   0x100
+
+/* a page-state change of `op` on the page or 2M region at `gpa`; 0 or an error */
+static int sev_snp_emu_psc(CPUX86State *env, hwaddr gpa, unsigned op,
+                           bool huge)
+{
+    uint64_t size = huge ? 2 * MiB : 4096;
+    uint8_t state;
+
+    if (gpa & (size - 1) || sev_snp_emu_page_state(gpa) == SNP_PAGE_NONE ||
+        sev_snp_emu_page_state(gpa + size - 4096) == SNP_PAGE_NONE) {
+        qemu_log_mask(LOG_GUEST_ERROR, "sev-emu: page state change of 0x%"
+                      HWADDR_PRIx " (%s): not guest RAM\n", gpa,
+                      huge ? "2M" : "4K");
+        return SNP_PSC_ERR_INVALID_ENTRY;
+    }
+    switch (op) {
+    case SNP_PSC_OP_PRIVATE:
+        state = SNP_PAGE_PRIVATE;
+        break;
+    case SNP_PSC_OP_SHARED:
+        state = 0;
+        break;
+    default:
+        qemu_log_mask(LOG_GUEST_ERROR, "sev-emu: page state change of 0x%"
+                      HWADDR_PRIx ": invalid operation %u\n", gpa, op);
+        return SNP_PSC_ERR_INVALID_ENTRY;
+    }
+    /* either way the page is no longer validated: drop the mappings */
+    for (hwaddr p = gpa; p < gpa + size; p += 4096) {
+        sev_snp_emu_page_set(p, state);
+    }
+    tlb_flush_all_cpus_synced(env_cpu(env));
+    return 0;
+}
+
+/* the PSC NAE event: a list of entries in the scratch area, processed in order */
+static void sev_emu_nae_psc(CPUX86State *env, hwaddr ghcb_gpa, GhcbPage *ghcb)
+{
+    struct {
+        uint16_t cur_entry;
+        uint16_t end_entry;
+        uint32_t reserved;
+        uint64_t entries[(sizeof(ghcb->shared_buffer) - 8) / 8];
+    } QEMU_PACKED psc;
+    unsigned i;
+    int error = 0;
+
+    if (!ghcb_scratch(ghcb_gpa, ghcb, sizeof(psc), &psc, false)) {
+        ghcb_malformed(ghcb, GHCB_ERR_INVALID_SCRATCH);
+        return;
+    }
+    if (psc.end_entry >= ARRAY_SIZE(psc.entries) ||
+        psc.cur_entry > psc.end_entry + 1) {
+        ghcb_result(ghcb, GHCB_RESULT_OK,
+                    (uint64_t)SNP_PSC_ERR_INVALID_HDR << 32);
+        return;
+    }
+    for (i = psc.cur_entry; i <= psc.end_entry; i++) {
+        uint64_t e = psc.entries[i];
+
+        error = sev_snp_emu_psc(env, e & 0x000ffffffffff000ULL,
+                                (e >> 52) & 0xf, e & (1ULL << 56));
+        if (error) {
+            break;
+        }
+        psc.cur_entry = i + 1;
+    }
+    /* the header tells the guest how far the hypervisor got */
+    ghcb_scratch(ghcb_gpa, ghcb, 8, &psc, true);
+    ghcb_result(ghcb, GHCB_RESULT_OK, (uint64_t)error << 32);
+}
+
+/* PVALIDATE and RMPADJUST operands: the page of a virtual address */
+static bool sev_snp_emu_page_of(CPUX86State *env, target_ulong va,
+                                target_ulong size, hwaddr *gpa,
+                                uintptr_t retaddr)
+{
+    hwaddr paddr;
+
+    if (va & (size - 1)) {
+        return false;
+    }
+    if (!sev_snp_emu_translate(env, va, &paddr)) {
+        /* not mapped: the instruction takes a page fault */
+        env->cr[2] = va;
+        raise_exception_err_ra(env, EXCP0E_PAGE, 0, retaddr);
+    }
+    *gpa = paddr & ~0xfffULL;
+    return true;
+}
+
+#define PVALIDATE_FAIL_INPUT        1
+#define PVALIDATE_FAIL_SIZEMISMATCH 6
+#define RMPADJUST_FAIL_INPUT        1
+#define RMPADJUST_FAIL_PERMISSION   2
+
+/*
+ * PVALIDATE: RAX the page's virtual address, ECX the size (0 4K, 1 2M), EDX
+ * bit 0 validate or rescind. Returns EAX in the low 32 bits and CF ("the
+ * page already was in that state") in bit 32.
+ */
+uint64_t helper_sev_pvalidate(CPUX86State *env, target_ulong rax,
+                              target_ulong rcx, target_ulong rdx)
+{
+    bool huge = (uint32_t)rcx == 1, validate = rdx & 1;
+    target_ulong size = huge ? 2 * MiB : 4096;
+    hwaddr gpa;
+    bool no_change = true;
+
+    if ((uint32_t)rcx > 1 ||
+        !sev_snp_emu_page_of(env, rax, size, &gpa, GETPC())) {
+        return PVALIDATE_FAIL_INPUT;
+    }
+    if (huge && sev_snp_emu_page_state(gpa + size - 4096) == SNP_PAGE_NONE) {
+        return PVALIDATE_FAIL_SIZEMISMATCH;
+    }
+    for (hwaddr p = gpa; p < gpa + size; p += 4096) {
+        uint8_t state = sev_snp_emu_page_state(p);
+
+        if (state == SNP_PAGE_NONE || !(state & SNP_PAGE_PRIVATE)) {
+            /* not a private page of this guest: no RMP entry to validate */
+            qemu_log_mask(LOG_GUEST_ERROR, "sev-emu: PVALIDATE of 0x%"
+                          HWADDR_PRIx ": not a private page\n", p);
+            return PVALIDATE_FAIL_INPUT;
+        }
+        if (!!(state & SNP_PAGE_VALIDATED) != validate) {
+            no_change = false;
+            sev_snp_emu_page_set(p, validate ? state | SNP_PAGE_VALIDATED :
+                                               state & ~SNP_PAGE_VALIDATED);
+        }
+    }
+    if (!validate) {
+        /* mappings of a now unvalidated page must not survive */
+        tlb_flush_all_cpus_synced(env_cpu(env));
+    }
+    return (uint64_t)no_change << 32;
+}
+
+/*
+ * RMPADJUST: RAX the page's virtual address, ECX the size, RDX the target
+ * VMPL (bits 7:0), its permissions (15:8) and the VMSA attribute (16). No
+ * VMPL model here: the VMSA attribute is recorded, permissions are accepted.
+ */
+target_ulong helper_sev_rmpadjust(CPUX86State *env, target_ulong rax,
+                                  target_ulong rcx, target_ulong rdx)
+{
+    bool huge = (uint32_t)rcx == 1;
+    target_ulong size = huge ? 2 * MiB : 4096;
+    unsigned vmpl = rdx & 0xff;
+    hwaddr gpa;
+
+    if ((uint32_t)rcx > 1 ||
+        !sev_snp_emu_page_of(env, rax, size, &gpa, GETPC())) {
+        return RMPADJUST_FAIL_INPUT;
+    }
+    if (vmpl == 0 || vmpl > 3) {
+        /* only a lower VMPL can be adjusted, the guest runs at VMPL0 */
+        return RMPADJUST_FAIL_PERMISSION;
+    }
+    for (hwaddr p = gpa; p < gpa + size; p += 4096) {
+        uint8_t state = sev_snp_emu_page_state(p);
+
+        if (state == SNP_PAGE_NONE || !(state & SNP_PAGE_PRIVATE)) {
+            return RMPADJUST_FAIL_INPUT;
+        }
+        sev_snp_emu_page_set(p, rdx & (1 << 16) ? state | SNP_PAGE_VMSA :
+                                                   state & ~SNP_PAGE_VMSA);
+    }
+    return 0;
 }
 
 /* ---- the MSR protocol ---- */
@@ -160,14 +349,18 @@ static void sev_emu_msr_protocol(CPUX86State *env, int next_eip_addend)
         env->sev_ghcb_registered_gpa = req & ~GHCB_MSR_INFO_MASK;
         resp = GHCB_MSR_REG_GPA_RESP | env->sev_ghcb_registered_gpa;
         break;
-    case GHCB_MSR_PSC_REQ:
+    case GHCB_MSR_PSC_REQ: {
         if (!sev_snp_enabled()) {
             goto terminate;
         }
-        /* page-state changes belong to the SNP emulation */
-        qemu_log_mask(LOG_UNIMP, "sev-emu: MSR page state change\n");
-        resp = GHCB_MSR_PSC_RESP | (1ULL << 32);
+        /* one 4K page: GFN in bits 51:12, operation in bits 55:52 */
+        uint64_t gpa = req & 0x000ffffffffff000ULL;
+        unsigned op = (req >> 52) & 0xf;
+        int error = sev_snp_emu_psc(env, gpa, op, false);
+
+        resp = GHCB_MSR_PSC_RESP | ((uint64_t)error << 32);
         break;
+    }
     case GHCB_MSR_TERM_REQ:
         sev_emu_terminate((req >> 12) & 0xf, (req >> 16) & 0xff);
         sev_emu_halt(env, next_eip_addend);
@@ -569,16 +762,26 @@ static void sev_emu_vmgexit_ghcb(CPUX86State *env, hwaddr gpa,
         halt = true;
         break;
     case SVM_VMGEXIT_PSC:
+        if (!sev_snp_enabled()) {
+            ghcb_malformed(ghcb, GHCB_ERR_INVALID_EVENT);
+            break;
+        }
+        sev_emu_nae_psc(env, gpa, ghcb);
+        break;
     case SVM_VMGEXIT_GUEST_REQUEST:
     case SVM_VMGEXIT_EXT_GUEST_REQUEST:
         if (!sev_snp_enabled()) {
             ghcb_malformed(ghcb, GHCB_ERR_INVALID_EVENT);
             break;
         }
-        /* the SNP emulation answers these; until then they fail cleanly */
-        qemu_log_mask(LOG_UNIMP, "sev-emu: SNP NAE event 0x%" PRIx64 "\n",
-                      ghcb->sw_exit_code);
-        ghcb_result(ghcb, GHCB_RESULT_OK, 1ULL << 32);
+        /*
+         * No firmware answers guest messages here (no attestation): the
+         * request fails the way a firmware error does, which guests handle.
+         */
+        qemu_log_mask(LOG_GUEST_ERROR, "sev-emu: SNP guest request refused "
+                      "(no firmware in the emulation)\n");
+        ghcb_result(ghcb, GHCB_RESULT_OK,
+                    (uint64_t)SNP_GUEST_FW_ERR_GENERIC << 32);
         break;
     case SVM_VMGEXIT_UNSUPPORTED_EVENT:
         qemu_log_mask(LOG_GUEST_ERROR, "sev-emu: guest reports an unsupported "

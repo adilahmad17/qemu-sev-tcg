@@ -134,6 +134,7 @@
 #define SVM_EXIT_MWAIT          0x08b
 #define SVM_EXIT_XSETBV         0x08d
 #define SVM_EXIT_NPF            0x400
+#define SVM_EXIT_PAGE_NOT_VALIDATED 0x404 /* SEV-SNP #VC */
 
 #define SVM_EXIT_ERR            -1
 
