@@ -1663,6 +1663,14 @@ sev_vm_state_change(void *opaque, bool running, RunState state)
 
     if (running) {
         if (!sev_check_state(sev_common, SEV_STATE_RUNNING)) {
+            /*
+             * An IGVM file is loaded in the reset phase, after the machine-done
+             * notifier that measures the other SEV guests: measure here, after
+             * its LAUNCH_UPDATE_DATA calls (no-op if already measured).
+             */
+            if (!sev_snp_enabled()) {
+                sev_launch_get_measure(NULL, NULL);
+            }
             klass->launch_finish(sev_common);
 
             /* add migration blocker */
@@ -1973,7 +1981,9 @@ static int sev_kvm_init(ConfidentialGuestSupport *cgs, Error **errp)
          * be collected without any reliance on the VMM. So skip registering
          * the notifier for SNP in favor of using guest attestation instead.
          */
-        qemu_add_machine_init_done_notifier(&sev_machine_done_notify);
+        if (!X86_MACHINE(qdev_get_machine())->igvm) {
+            qemu_add_machine_init_done_notifier(&sev_machine_done_notify);
+        }
     }
     return 0;
 }
