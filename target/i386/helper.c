@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "qapi/qapi-events-run-state.h"
 #include "cpu.h"
+#include "sev.h"
 #include "exec/cputlb.h"
 #include "exec/translation-block.h"
 #include "exec/target_page.h"
@@ -617,6 +618,14 @@ void do_cpu_init(X86CPU *cpu)
     CPUX86State *save = g_new(CPUX86State, 1);
     int sipi = cs->interrupt_request & CPU_INTERRUPT_SIPI;
 
+#ifdef CONFIG_SEV
+    if (sev_emu_ap_init(cs)) {
+        /* parked in an AP reset hold: the state stays, the SIPI resumes it */
+        g_free(save);
+        cs->interrupt_request = sipi;
+        return;
+    }
+#endif
     *save = *env;
 
     cpu_reset(cs);
@@ -641,6 +650,11 @@ void do_cpu_sipi(X86CPU *cpu)
     if (env->hflags & HF_SMM_MASK) {
         return;
     }
+#ifdef CONFIG_SEV
+    if (sev_emu_ap_sipi(CPU(cpu))) {
+        return;
+    }
+#endif
     apic_sipi(cpu->apic_state);
 }
 

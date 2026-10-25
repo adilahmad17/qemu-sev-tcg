@@ -23,6 +23,7 @@
 #include "exec/helper-proto.h"
 #include "exec/watchpoint.h"
 #include "tcg/helper-tcg.h"
+#include "sev.h"
 
 
 static inline bool hw_local_breakpoint_enabled(unsigned long dr7, int index)
@@ -237,6 +238,11 @@ void breakpoint_handler(CPUState *cs)
 
 target_ulong helper_get_dr(CPUX86State *env, int reg)
 {
+#ifdef CONFIG_SEV
+    if (reg == 7 && sev_es_emu_active()) {
+        sev_emu_raise_vc(env, SVM_EXIT_READ_DR7, GETPC());
+    }
+#endif
     if (reg >= 4 && reg < 6) {
         if (env->cr[4] & CR4_DE_MASK) {
             raise_exception_ra(env, EXCP06_ILLOP, GETPC());
@@ -256,6 +262,11 @@ target_ulong helper_get_dr(CPUX86State *env, int reg)
 
 void helper_set_dr(CPUX86State *env, int reg, target_ulong t0)
 {
+#ifdef CONFIG_SEV
+    if (reg == 7 && sev_es_emu_active()) {
+        sev_emu_raise_vc(env, SVM_EXIT_WRITE_DR7, GETPC());
+    }
+#endif
     if (reg >= 4 && reg < 6) {
         if (env->cr[4] & CR4_DE_MASK) {
             raise_exception_ra(env, EXCP06_ILLOP, GETPC());

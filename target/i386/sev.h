@@ -25,11 +25,24 @@
 #define sev_es_enabled() 0
 #define sev_snp_enabled() 0
 #define sev_emu_enabled() 0
+#define sev_es_emu_active() 0
 #else
 bool sev_enabled(void);
 bool sev_es_enabled(void);
 bool sev_snp_enabled(void);
 bool sev_emu_enabled(void);
+/* the #VC/GHCB emulation of sev-emu is on (SEV-ES policy or SEV-SNP) */
+extern bool sev_emu_es_flag;
+static inline bool sev_es_emu_active(void)
+{
+    return sev_emu_es_flag;
+}
+uint64_t sev_emu_sev_status(void);
+uint64_t sev_emu_hv_features(void);
+int sev_emu_ap_creation(uint32_t request, uint32_t apic_id, hwaddr vmsa_gpa,
+                        uint64_t sev_features);
+bool sev_emu_ap_init(CPUState *cpu);
+bool sev_emu_ap_sipi(CPUState *cpu);
 #endif
 
 #if !defined(CONFIG_USER_ONLY)

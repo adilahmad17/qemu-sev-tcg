@@ -9533,7 +9533,7 @@ static void x86_cpu_reset_hold(Object *obj, ResetType type)
     }
 #endif
     if (tcg_enabled()) {
-        /* an initial VMSA of an emulated SEV-ES guest (KVM does this in kvm_arch_reset_vcpu) */
+        /* an emulated SEV-ES guest's initial VMSA (KVM: kvm_arch_reset_vcpu) */
         sev_es_set_reset_vector(cs);
     }
 

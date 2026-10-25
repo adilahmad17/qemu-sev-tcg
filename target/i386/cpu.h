@@ -662,6 +662,7 @@ typedef enum X86Seg {
 #define ESA_FEATURE_XFD_MASK            (1U << ESA_FEATURE_XFD_BIT)
 
 /* AMD SEV MSR */
+#define MSR_AMD64_SEV_ES_GHCB           0xc0010130
 #define MSR_AMD64_SEV                   0xc0010131
 
 /* CPUID feature bits available in XCR0 */
@@ -1505,6 +1506,7 @@ uint64_t x86_cpu_get_supported_feature_word(X86CPU *cpu, FeatureWord w);
 #define EXCP10_COPR     16
 #define EXCP11_ALGN     17
 #define EXCP12_MCHK     18
+#define EXCP1D_VC       29 /* SEV-ES VMM communication */
 
 #define EXCP_VMEXIT     0x100 /* only for system emulation */
 #define EXCP_SYSCALL    0x101 /* only for user emulation */
@@ -2214,6 +2216,11 @@ typedef struct CPUArchState {
     /* RAPL MSR */
     uint64_t msr_rapl_power_unit;
     uint64_t msr_pkg_energy_status;
+
+    /* emulated SEV-ES guest (sev-emu): GHCB MSR, registered GHCB, AP reset hold */
+    uint64_t sev_ghcb_msr;
+    uint64_t sev_ghcb_registered_gpa;
+    uint8_t sev_ap_reset_hold;
 
     /* Fields up to this point are cleared by a CPU reset */
     struct {} end_reset_fields;

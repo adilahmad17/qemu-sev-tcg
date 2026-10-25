@@ -24,6 +24,7 @@
 #include "exec/helper-proto.h"
 #include "exec/cputlb.h"
 #include "helper-tcg.h"
+#include "sev.h"
 
 /*
  * NOTE: the translator must set DisasContext.cc_op to CC_OP_EFLAGS
@@ -53,6 +54,11 @@ void helper_cpuid(CPUX86State *env)
     uint32_t eax, ebx, ecx, edx;
 
     cpu_svm_check_intercept_param(env, SVM_EXIT_CPUID, 0, GETPC());
+#if defined(CONFIG_SEV) && !defined(CONFIG_USER_ONLY)
+    if (sev_es_emu_active()) {
+        sev_emu_raise_vc(env, SVM_EXIT_CPUID, GETPC());
+    }
+#endif
 
     cpu_x86_cpuid(env, (uint32_t)env->regs[R_EAX], (uint32_t)env->regs[R_ECX],
                   &eax, &ebx, &ecx, &edx);
@@ -83,6 +89,11 @@ G_NORETURN void helper_rdpmc(CPUX86State *env)
         raise_exception_ra(env, EXCP0D_GPF, GETPC());
     }
     cpu_svm_check_intercept_param(env, SVM_EXIT_RDPMC, 0, GETPC());
+#if defined(CONFIG_SEV) && !defined(CONFIG_USER_ONLY)
+    if (sev_es_emu_active()) {
+        sev_emu_raise_vc(env, SVM_EXIT_RDPMC, GETPC());
+    }
+#endif
 
     /* currently unimplemented */
     qemu_log_mask(LOG_UNIMP, "x86: unimplemented rdpmc\n");

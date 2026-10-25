@@ -30,6 +30,9 @@
 #include "system/kvm.h"
 #include "kvm/kvm_i386.h"
 #include "sev.h"
+#include "sev-emu.h"
+#include "qemu/log.h"
+#include "system/address-spaces.h"
 #include "system/cpus.h"
 #include "system/system.h"
 #include "system/runstate.h"
@@ -524,6 +527,16 @@ static void sev_apply_cpu_context(CPUState *cpu)
             env->eip = launch_vmsa->vmsa.rip;
             env->eflags = launch_vmsa->vmsa.rflags;
 
+            env->star = launch_vmsa->vmsa.star;
+            env->lstar = launch_vmsa->vmsa.lstar;
+            env->cstar = launch_vmsa->vmsa.cstar;
+            env->fmask = launch_vmsa->vmsa.sfmask;
+            env->kernelgsbase = launch_vmsa->vmsa.kernel_gs_base;
+            env->sysenter_cs = launch_vmsa->vmsa.sysenter_cs;
+            env->sysenter_esp = launch_vmsa->vmsa.sysenter_esp;
+            env->sysenter_eip = launch_vmsa->vmsa.sysenter_eip;
+            env->cr[2] = launch_vmsa->vmsa.cr2;
+
             cpu_set_fpuc(env, launch_vmsa->vmsa.x87_fcw);
             env->mxcsr = launch_vmsa->vmsa.mxcsr;
 
@@ -648,8 +661,9 @@ static int check_vmsa_supported(SevCommonState *sev_common, hwaddr gpa,
     return 0;
 }
 
-static int sev_set_cpu_context(uint16_t cpu_index, const void *ctx,
-                               uint32_t ctx_len, hwaddr gpa, Error **errp)
+/* records `ctx` as the initial VMSA of vCPU `cpu_index` (applied at reset) */
+static int sev_record_cpu_context(uint16_t cpu_index, const void *ctx,
+                                  uint32_t ctx_len, hwaddr gpa, Error **errp)
 {
     SevCommonState *sev_common = SEV_COMMON(MACHINE(qdev_get_machine())->cgs);
     SevLaunchVmsa *launch_vmsa;
@@ -704,8 +718,18 @@ static int sev_set_cpu_context(uint16_t cpu_index, const void *ctx,
         QTAILQ_INSERT_TAIL(&sev_common->launch_vmsa, launch_vmsa, next);
     }
 
+    return 0;
+}
+
+static int sev_set_cpu_context(uint16_t cpu_index, const void *ctx,
+                               uint32_t ctx_len, hwaddr gpa, Error **errp)
+{
+    if (sev_record_cpu_context(cpu_index, ctx, ctx_len, gpa, errp) < 0) {
+        return -1;
+    }
+
     /* Synchronise the VMSA with the current CPU state */
-    sev_apply_cpu_context(cpu);
+    sev_apply_cpu_context(qemu_get_cpu(cpu_index));
 
     return 0;
 }
@@ -762,6 +786,139 @@ sev_get_reduced_phys_bits(void)
     SevCommonState *sev_common = SEV_COMMON(MACHINE(qdev_get_machine())->cgs);
 
     return sev_common ? sev_common->reduced_phys_bits : 0;
+}
+
+bool sev_emu_es_flag;
+
+/* the SEV_STATUS MSR of the emulated guest */
+uint64_t sev_emu_sev_status(void)
+{
+    uint64_t status = 1;
+
+    if (sev_es_enabled()) {
+        status |= 2;
+    }
+    if (sev_snp_enabled()) {
+        status |= 4;
+    }
+    return status;
+}
+
+/* GHCB hypervisor features (HV_FEATURES): what the SNP emulation offers */
+uint64_t sev_emu_hv_features(void)
+{
+    return sev_snp_enabled() ?
+           GHCB_HV_FT_SNP | GHCB_HV_FT_SNP_AP_CREATION : 0;
+}
+
+static void sev_emu_ap_create_work(CPUState *cs, run_on_cpu_data data)
+{
+    /* the reset applies the recorded VMSA (sev_es_set_reset_vector) */
+    cpu_reset(cs);
+    cpu_reset_interrupt(cs, CPU_INTERRUPT_INIT | CPU_INTERRUPT_SIPI);
+    cs->halted = 0;
+}
+
+static void sev_emu_ap_destroy_work(CPUState *cs, run_on_cpu_data data)
+{
+    cs->halted = 1;
+}
+
+/*
+ * The AP creation NAE event of SEV-SNP (also accepted for the emulated SEV-ES
+ * guest): the vCPU with `apic_id` (re)starts from the VMSA at `vmsa_gpa`, or
+ * is parked. Checks as in KVM's sev_snp_ap_creation(). Returns -1 when the
+ * request is invalid.
+ */
+int sev_emu_ap_creation(uint32_t request, uint32_t apic_id, hwaddr vmsa_gpa,
+                        uint64_t sev_features)
+{
+    SevCommonState *sev_common = SEV_COMMON(MACHINE(qdev_get_machine())->cgs);
+    CPUState *target = cpu_by_arch_id(apic_id);
+    g_autofree uint8_t *vmsa = NULL;
+    Error *err = NULL;
+
+    if (!target) {
+        qemu_log_mask(LOG_GUEST_ERROR, "sev-emu: AP creation for the unknown "
+                      "APIC ID %u\n", apic_id);
+        return -1;
+    }
+    if (request == SVM_VMGEXIT_AP_DESTROY) {
+        async_run_on_cpu(target, sev_emu_ap_destroy_work, RUN_ON_CPU_NULL);
+        return 0;
+    }
+    if (request != SVM_VMGEXIT_AP_CREATE &&
+        request != SVM_VMGEXIT_AP_CREATE_ON_INIT) {
+        qemu_log_mask(LOG_GUEST_ERROR, "sev-emu: invalid AP creation request "
+                      "%u\n", request);
+        return -1;
+    }
+    if (sev_features != sev_common->sev_features) {
+        qemu_log_mask(LOG_GUEST_ERROR, "sev-emu: AP sev_features 0x%" PRIx64
+                      " differ from the guest's 0x%" PRIx64 "\n", sev_features,
+                      sev_common->sev_features);
+        return -1;
+    }
+    if (vmsa_gpa & 0xfff || !(vmsa_gpa & 0x1fffff)) {
+        /* a page, and (as KVM requires) not 2 MB aligned */
+        qemu_log_mask(LOG_GUEST_ERROR, "sev-emu: invalid AP VMSA address 0x%"
+                      HWADDR_PRIx "\n", vmsa_gpa);
+        return -1;
+    }
+    vmsa = g_malloc(4096);
+    address_space_read(&address_space_memory, vmsa_gpa,
+                       MEMTXATTRS_UNSPECIFIED, vmsa, 4096);
+    if (sev_record_cpu_context(target->cpu_index, vmsa, 4096, vmsa_gpa,
+                               &err) < 0) {
+        qemu_log_mask(LOG_GUEST_ERROR, "sev-emu: AP VMSA rejected: %s\n",
+                      error_get_pretty(err));
+        error_free(err);
+        return -1;
+    }
+    if (request == SVM_VMGEXIT_AP_CREATE) {
+        async_run_on_cpu(target, sev_emu_ap_create_work, RUN_ON_CPU_NULL);
+    }
+    /* AP_CREATE_ON_INIT: the next INIT resets the vCPU into the recorded VMSA */
+    return 0;
+}
+
+/*
+ * INIT of a vCPU parked by an AP reset hold request: an SEV-ES vCPU cannot
+ * be reset by the hypervisor; the state stays and a SIPI resumes it.
+ */
+bool sev_emu_ap_init(CPUState *cs)
+{
+    CPUX86State *env = &X86_CPU(cs)->env;
+
+    return sev_es_emu_active() &&
+           env->sev_ap_reset_hold != SEV_AP_RESET_HOLD_NONE;
+}
+
+/* SIPI of a parked vCPU: answer the reset hold request and resume after VMGEXIT */
+bool sev_emu_ap_sipi(CPUState *cs)
+{
+    CPUX86State *env = &X86_CPU(cs)->env;
+
+    if (!sev_es_emu_active() ||
+        env->sev_ap_reset_hold == SEV_AP_RESET_HOLD_NONE) {
+        return false;
+    }
+    if (env->sev_ap_reset_hold == SEV_AP_RESET_HOLD_MSR) {
+        env->sev_ghcb_msr = GHCB_MSR_AP_RESET_HOLD_RESP | (1ULL << 12);
+    } else {
+        GhcbPage *ghcb = g_malloc(sizeof(*ghcb));
+
+        address_space_read(&address_space_memory, env->sev_ghcb_msr,
+                           MEMTXATTRS_UNSPECIFIED, ghcb, sizeof(*ghcb));
+        GHCB_SET(ghcb, sw_exit_info_1, 0);
+        GHCB_SET(ghcb, sw_exit_info_2, 1);
+        address_space_write(&address_space_memory, env->sev_ghcb_msr,
+                            MEMTXATTRS_UNSPECIFIED, ghcb, sizeof(*ghcb));
+        g_free(ghcb);
+    }
+    env->sev_ap_reset_hold = SEV_AP_RESET_HOLD_NONE;
+    cs->halted = 0;
+    return true;
 }
 
 uint64_t
@@ -3153,6 +3310,8 @@ static int sev_emu_init(ConfidentialGuestSupport *cgs, Error **errp)
     sev_common->state = SEV_STATE_UNINIT;
     /* what the emulated firmware accepts in a VMSA's sev_features */
     sev_common->supported_sev_features = SVM_SEV_FEAT_SNP_ACTIVE;
+    /* #VC and GHCB emulation from now on (the TCG helpers read this flag) */
+    sev_emu_es_flag = sev_es_enabled();
 
     /*
      * The cbitpos value will be placed in bit positions 5:0 of the EBX

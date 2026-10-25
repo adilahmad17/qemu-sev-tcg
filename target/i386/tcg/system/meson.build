@@ -8,3 +8,7 @@ i386_system_ss.add(when: ['CONFIG_TCG', 'CONFIG_SYSTEM_ONLY'], if_true: files(
   'svm_helper.c',
   'seg_helper.c',
 ))
+
+i386_system_ss.add(when: ['CONFIG_TCG', 'CONFIG_SYSTEM_ONLY', 'CONFIG_SEV'], if_true: files(
+  'sev-emu.c',
+))

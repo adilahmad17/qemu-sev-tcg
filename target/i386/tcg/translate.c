@@ -34,6 +34,7 @@
 #include "decode-new.h"
 
 #include "exec/log.h"
+#include "sev.h"
 
 #define HELPER_H "helper.h"
 #include "exec/helper-info.c.inc"
@@ -1807,6 +1808,26 @@ static void gen_far_jmp(DisasContext *s)
     s->base.is_jmp = DISAS_JUMP;
 }
 
+/*
+ * Emulated SEV-ES guest: the hypervisor's intercept of this instruction
+ * becomes a #VC exception with the SVM exit code as error code.  The
+ * emulation state is fixed for the VM's lifetime, so it is a translation
+ * time constant; true when the exception was emitted.
+ */
+static bool gen_sev_es_vc(DisasContext *s, uint32_t exit_code)
+{
+#if defined(CONFIG_SEV) && !defined(CONFIG_USER_ONLY)
+    if (sev_es_emu_active()) {
+        gen_update_cc_op(s);
+        gen_update_eip_cur(s);
+        gen_helper_sev_es_vc(tcg_env, tcg_constant_i32(exit_code));
+        s->base.is_jmp = DISAS_NORETURN;
+        return true;
+    }
+#endif
+    return false;
+}
+
 static void gen_svm_check_intercept(DisasContext *s, uint32_t type)
 {
     /* no SVM activated; fast case */
@@ -2948,6 +2969,18 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
             }
             gen_update_cc_op(s);
             gen_update_eip_cur(s);
+#if defined(CONFIG_SEV) && !defined(CONFIG_USER_ONLY)
+            if (sev_es_emu_active()) {
+                if (s->prefix & PREFIX_REPZ) {
+                    /* VMGEXIT: the GHCB MSR or page goes to the hypervisor */
+                    gen_helper_sev_vmgexit(tcg_env, cur_insn_len_i32(s));
+                    s->base.is_jmp = DISAS_EOB_NEXT;
+                } else {
+                    gen_sev_es_vc(s, SVM_EXIT_VMMCALL);
+                }
+                break;
+            }
+#endif
             gen_helper_vmmcall(tcg_env);
             break;
 

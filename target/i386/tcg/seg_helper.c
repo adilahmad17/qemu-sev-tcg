@@ -677,6 +677,7 @@ int exception_has_error_code(int intno)
     case 13:
     case 14:
     case 17:
+    case EXCP1D_VC:
         return 1;
     }
     return 0;

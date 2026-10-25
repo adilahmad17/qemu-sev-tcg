@@ -65,6 +65,16 @@ G_NORETURN void raise_exception_ra(CPUX86State *env, int exception_index,
                                    uintptr_t retaddr);
 G_NORETURN void raise_exception_err(CPUX86State *env, int exception_index,
                                     int error_code);
+#ifndef CONFIG_USER_ONLY
+/* sev-emu.c */
+G_NORETURN void sev_emu_raise_vc(CPUX86State *env, uint32_t exit_code,
+                                 uintptr_t retaddr);
+bool sev_emu_msr_passthrough(uint32_t index);
+/* system/misc_helper.c: MSR access without exceptions (false: #GP) */
+bool x86_rdmsr_core(CPUX86State *env, uint32_t index, uint64_t *pval);
+bool x86_wrmsr_core(CPUX86State *env, uint32_t index, uint64_t val);
+#endif
+
 G_NORETURN void raise_exception_err_ra(CPUX86State *env, int exception_index,
                                        int error_code, uintptr_t retaddr);
 G_NORETURN void raise_interrupt(CPUX86State *nenv, int intno, int next_eip_addend);

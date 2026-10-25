@@ -4723,6 +4723,18 @@ static void gen_WRxxBASE(DisasContext *s, X86DecodedInsn *decode)
     tcg_gen_mov_tl(base, s->T0);
 }
 
+static void gen_INVD(DisasContext *s, X86DecodedInsn *decode)
+{
+    /* nothing to invalidate; an emulated SEV-ES guest sees the intercept */
+    gen_sev_es_vc(s, SVM_EXIT_INVD);
+}
+
+static void gen_WBINVD(DisasContext *s, X86DecodedInsn *decode)
+{
+    /* nothing to write back; an emulated SEV-ES guest sees the intercept */
+    gen_sev_es_vc(s, SVM_EXIT_WBINVD);
+}
+
 static void gen_XADD(DisasContext *s, X86DecodedInsn *decode)
 {
     MemOp ot = decode->op[1].ot;
