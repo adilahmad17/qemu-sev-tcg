@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # build.sh -- build the QEMU with the emulated AMD SEV / SEV-ES / SEV-SNP (branch dev-sev)
 #
-# The emulation is functional only (no attestation, no memory isolation) and runs under TCG, so the
-# build has no KVM. It needs libigvm, which is built first from a pinned release. Everything goes to
+# The emulation is functional only (no attestation, no memory isolation) and runs under TCG, without
+# KVM or SEV hardware. It needs libigvm, which is built first from a pinned release. Everything goes to
 # one prefix: bin/qemu-system-x86_64 and share/qemu (the ROMs and firmware QEMU looks for next to the
 # binary, which is why the binary must stay where it was installed).
 #
@@ -106,12 +106,14 @@ if [ ! -f "$PREFIX/lib64/pkgconfig/igvm.pc" ]; then
     log "libigvm $ver installed in $PREFIX"
 fi
 
-# QEMU: x86_64 system emulation, TCG only (the emulated SEV refuses KVM), IGVM for the guest image
+# QEMU: x86_64 system emulation, IGVM for the guest image. KVM support stays enabled because QEMU compiles
+# its SEV code (and with it the emulation) only with it; the emulated SEV itself refuses KVM at run time and
+# needs no /dev/kvm, so the result runs on any machine.
 log "configuring QEMU"
 mkdir -p "$BUILD"
 cd "$BUILD"
 PKG_CONFIG_PATH=$PREFIX/lib64/pkgconfig ../configure --prefix="$PREFIX" \
-    --target-list=x86_64-softmmu --disable-kvm --enable-igvm --enable-slirp \
+    --target-list=x86_64-softmmu --enable-kvm --enable-igvm --enable-slirp \
     --disable-docs --disable-werror --disable-xen --disable-gtk --disable-sdl --disable-vnc \
     --disable-opengl --disable-virglrenderer
 log "building QEMU ($JOBS jobs)"
