@@ -44,10 +44,23 @@ SEV_ES_QEMU_OPTS=-M q35,confidential-guest-support=sev0,igvm-cfg=igvm0 \
 	-cpu max -smp 2 \
 	-device isa-debugcon,chardev=output -device isa-debug-exit,iobase=0xf4,iosize=0x4
 
-$(SEV_ES_TESTS): CFLAGS+=-mno-red-zone
+SEV_SNP_TESTS=sev-snp
+SEV_SNP_QEMU_OPTS=-M q35,confidential-guest-support=sev0,igvm-cfg=igvm0 \
+	-object sev-snp-emu,id=sev0,cbitpos=51,reduced-phys-bits=1,policy=0x30000 \
+	-cpu max -smp 2 \
+	-device isa-debugcon,chardev=output -device isa-debug-exit,iobase=0xf4,iosize=0x4
+
+$(SEV_ES_TESTS) $(SEV_SNP_TESTS): CFLAGS+=-mno-red-zone
+
+sev-snp.igvm: sev-snp $(X64_SYSTEM_SRC)/mkigvm.py
+	$(PYTHON) $(X64_SYSTEM_SRC)/mkigvm.py --platform snp $< $@
 
 %.igvm: % $(X64_SYSTEM_SRC)/mkigvm.py
 	$(PYTHON) $(X64_SYSTEM_SRC)/mkigvm.py --platform sev-es $< $@
+
+run-sev-snp: run-%: %.igvm
+run-sev-snp: QEMU_OPTS=$(SEV_SNP_QEMU_OPTS) -object igvm-cfg,id=igvm0,file=$<.igvm -name
+run-plugin-sev-snp-with-%: QEMU_OPTS=$(SEV_SNP_QEMU_OPTS) -object igvm-cfg,id=igvm0,file=$(call strip-plugin,$<).igvm -name
 
 $(foreach t,$(SEV_ES_TESTS),run-$(t)): run-%: %.igvm
 $(foreach t,$(SEV_ES_TESTS),run-$(t)): QEMU_OPTS=$(SEV_ES_QEMU_OPTS) -object igvm-cfg,id=igvm0,file=$<.igvm -name

@@ -36,6 +36,15 @@
 #define SVM_VMGEXIT_AP_CREATION 0x80000013
 #define SVM_VMGEXIT_HV_FEATURES 0x8000fffd
 #define SVM_VMGEXIT_TERM_REQUEST 0x8000fffe
+#define SVM_EXIT_PAGE_NOT_VALIDATED 0x404
+#define SVM_VMGEXIT_PSC         0x80000010
+#define SVM_VMGEXIT_GUEST_REQUEST 0x80000011
+#define GHCB_MSR_PSC_REQ    0x014
+#define GHCB_MSR_PSC_RESP   0x015
+#define GHCB_MSR_REG_GPA_REQ 0x012
+#define GHCB_MSR_REG_GPA_RESP 0x013
+#define SNP_SECRETS_GPA     0x3fe000
+#define SNP_CPUID_GPA       0x3ff000
 
 #define GHCB_MSR_INFO_REQ   0x002
 #define GHCB_MSR_INFO_RESP  0x001
@@ -186,6 +195,28 @@ static __attribute__((naked)) void fault_entry(void)
 static unsigned vc_counts[16];
 static unsigned vc_unexpected;
 static uint64_t vc_last_unexpected;
+static uint64_t vc_last_cr2;      /* of the last "page not validated" #VC */
+
+/* PVALIDATE: returns EAX, *no_change = CF */
+static int pvalidate(void *va, int huge, int validate, int *no_change)
+{
+    int rc;
+    uint8_t cf;
+    asm volatile(".byte 0xf2, 0x0f, 0x01, 0xff\n\tsetc %1"
+                 : "=a"(rc), "=r"(cf) : "a"(va), "c"(huge), "d"(validate)
+                 : "memory", "cc");
+    *no_change = cf;
+    return rc;
+}
+
+/* RMPADJUST: returns EAX */
+static int rmpadjust(void *va, int huge, uint64_t attrs)
+{
+    int rc;
+    asm volatile(".byte 0xf3, 0x0f, 0x01, 0xfe"
+                 : "=a"(rc) : "a"(va), "c"(huge), "d"(attrs) : "memory", "cc");
+    return rc;
+}
 
 static unsigned vc_class(uint64_t code)
 {
@@ -216,6 +247,8 @@ static unsigned vc_class(uint64_t code)
         return 12;
     case SVM_EXIT_RDTSC:
         return 13;
+    case SVM_EXIT_PAGE_NOT_VALIDATED:
+        return 14;
     default:
         return 0;
     }
@@ -339,6 +372,17 @@ void vc_handler_c(struct vc_regs *r)
         ghcb_call(g, SVM_EXIT_WRITE_DR7, 0, 0);
         r->rip += prefixes + 3;
         return;
+    case SVM_EXIT_PAGE_NOT_VALIDATED: {
+        /* validate the page in CR2 and retry the instruction */
+        uint64_t cr2;
+        int nc;
+        asm volatile("mov %%cr2, %0" : "=r"(cr2));
+        vc_last_cr2 = cr2;
+        if (pvalidate((void *)(cr2 & ~0xfffULL), 0, 1, &nc) != 0) {
+            goto unexpected;
+        }
+        return;
+    }
     default:
         break;
     }
@@ -490,7 +534,239 @@ static void test_ap_creation(void)
     CHECK(ap_started, "AP started from the VMSA and ran its entry");
 }
 
-#ifndef SEV_ES_TERM_TEST
+#if defined(SEV_SNP_TEST)
+struct snp_cpuid_fn {
+    uint32_t eax_in, ecx_in;
+    uint64_t xcr0_in, xss_in;
+    uint32_t eax, ebx, ecx, edx;
+    uint64_t reserved;
+} __attribute__((packed));
+
+struct snp_cpuid_table {
+    uint32_t count, reserved1;
+    uint64_t reserved2;
+    struct snp_cpuid_fn fn[64];
+} __attribute__((packed));
+
+static const struct snp_cpuid_fn *cpuid_page_find(uint32_t leaf, uint32_t sub)
+{
+    const struct snp_cpuid_table *t = (const void *)SNP_CPUID_GPA;
+    for (uint32_t i = 0; i < t->count && i < 64; i++) {
+        if (t->fn[i].eax_in == leaf && t->fn[i].ecx_in == sub) {
+            return &t->fn[i];
+        }
+    }
+    return 0;
+}
+
+static uint8_t snp_pages[4 * 4096] __attribute__((aligned(4096)));
+static uint8_t snp_vmsa[3 * 4096] __attribute__((aligned(4096)));
+
+static uint64_t psc_msr(void *va, unsigned op)
+{
+    return ghcb_msr_protocol(GHCB_MSR_PSC_REQ | ((uint64_t)va & 0x000ffffffffff000ULL) |
+                             ((uint64_t)op << 52));
+}
+
+static uint64_t psc_ghcb(void *va, unsigned op, int huge)
+{
+    struct ghcb *g = &ghcb_page;
+    uint16_t *hdr = (uint16_t *)g->shared_buffer;
+    uint64_t *entries = (uint64_t *)(g->shared_buffer + 8);
+    ghcb_clear(g);
+    hdr[0] = 0;
+    hdr[1] = 0;
+    *(uint32_t *)(hdr + 2) = 0;
+    entries[0] = ((uint64_t)va & 0x000ffffffffff000ULL) | ((uint64_t)op << 52) |
+                 (huge ? 1ULL << 56 : 0);
+    GHCB_SET(g, sw_scratch, (uint64_t)g->shared_buffer);
+    ghcb_call(g, SVM_VMGEXIT_PSC, 0, 0);
+    return g->sw_exit_info_2;
+}
+
+int main(void)
+{
+    struct ghcb *g = &ghcb_page;
+    const struct snp_cpuid_table *table = (const void *)SNP_CPUID_GPA;
+    const struct snp_cpuid_fn *fn;
+    const uint8_t *secrets = (const uint8_t *)SNP_SECRETS_GPA;
+    uint64_t v, resp;
+    unsigned before;
+    int rc, nc, nz;
+
+    idt_init();
+    ml_printf("sev-snp: SNP emulation test\n");
+
+    v = rdmsr(MSR_SEV_STATUS);
+    CHECK(v == 0x7, "SEV_STATUS is SEV+ES+SNP (%" PRIx64 ")", v);
+    resp = ghcb_msr_protocol(GHCB_MSR_HV_FT_REQ);
+    CHECK((resp >> 12) == 3, "hypervisor features: SNP and AP creation (%" PRIx64 ")", resp);
+
+    /* the CPUID page */
+    CHECK(table->count > 0 && table->count <= 64, "CPUID page has %u entries", table->count);
+    fn = cpuid_page_find(0x8000001f, 0);
+    CHECK(fn && (fn->eax & 0x1a) == 0x1a && (fn->ebx & 0x3f) == 51,
+          "CPUID page: 0x8000001f with SEV, ES, SNP and C-bit 51");
+    fn = cpuid_page_find(0xd, 0);
+    CHECK(fn && fn->ebx == 0x240 && fn->xcr0_in == 1, "CPUID page: leaf 0xd.0 convention");
+    fn = cpuid_page_find(1, 0);
+    CHECK(fn && (fn->ecx & (1 << 21)), "CPUID page: leaf 1 has x2APIC");
+    CHECK(cpuid_page_find(0x80000000, 0) && cpuid_page_find(7, 0),
+          "CPUID page: leaves 0x80000000 and 7");
+
+    /* the secrets page: version and a VMPCK0 */
+    nz = 0;
+    for (int i = 0x20; i < 0x40; i++) {
+        nz |= secrets[i];
+    }
+    CHECK(*(const uint32_t *)secrets == 3 && nz, "secrets page: version 3, VMPCK0 set");
+
+    /* GHCB registration */
+    resp = ghcb_msr_protocol(GHCB_MSR_REG_GPA_REQ | (uint64_t)g);
+    CHECK(resp == (GHCB_MSR_REG_GPA_RESP | (uint64_t)g), "GHCB registered (%" PRIx64 ")", resp);
+
+    /*
+     * The validation check applies to private (C=1) mappings: set the C-bit
+     * in the 2 MB page-table entry that maps the test pages, as a guest does.
+     */
+    {
+        uint64_t cr3, *pml4, *pdpt, *pd;
+        uint64_t addr = (uint64_t)snp_pages;
+        asm volatile("mov %%cr3, %0" : "=r"(cr3));
+        pml4 = (uint64_t *)(cr3 & ~0xfffULL);
+        pdpt = (uint64_t *)(pml4[(addr >> 39) & 511] & 0x000ffffffffff000ULL);
+        pd = (uint64_t *)(pdpt[(addr >> 30) & 511] & 0x000ffffffffff000ULL);
+        pd[(addr >> 21) & 511] |= 1ULL << 51;
+        asm volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
+    }
+
+    /* PVALIDATE on launched (validated) pages: no change */
+    rc = pvalidate(snp_pages, 0, 1, &nc);
+    CHECK(rc == 0 && nc == 1, "PVALIDATE of a launched page: no change (rc %d cf %d)", rc, nc);
+    /* rescind, then touch: #VC page-not-validated with CR2, the handler validates */
+    rc = pvalidate(snp_pages, 0, 0, &nc);
+    CHECK(rc == 0 && nc == 0, "PVALIDATE rescind (rc %d cf %d)", rc, nc);
+    before = vc_counts[14];
+    snp_pages[16] = 0x5a;
+    CHECK(vc_counts[14] == before + 1 && (vc_last_cr2 & ~0xfffULL) == (uint64_t)snp_pages &&
+          snp_pages[16] == 0x5a,
+          "access to an unvalidated page: #VC 0x404, CR2 %" PRIx64 ", retried", vc_last_cr2);
+    rc = pvalidate(snp_pages, 0, 1, &nc);
+    CHECK(rc == 0 && nc == 1, "the handler's validation counts: no change now");
+    /* a page outside the mapping and a bad size */
+    rc = pvalidate(snp_pages + 7, 0, 1, &nc);
+    CHECK(rc == 1, "PVALIDATE of an unaligned address fails (rc %d)", rc);
+    rc = pvalidate(snp_pages, 2, 1, &nc);
+    CHECK(rc == 1, "PVALIDATE with an invalid size fails (rc %d)", rc);
+
+    /* page-state changes: shared pages cannot be validated */
+    resp = psc_msr(snp_pages + 4096, 2);
+    CHECK((resp & 0xfff) == GHCB_MSR_PSC_RESP && (resp >> 32) == 0, "MSR PSC to shared (%" PRIx64 ")", resp);
+    rc = pvalidate(snp_pages + 4096, 0, 1, &nc);
+    CHECK(rc == 1, "PVALIDATE of a shared page fails (rc %d)", rc);
+    resp = psc_msr(snp_pages + 4096, 7);
+    CHECK((resp >> 32) != 0, "MSR PSC with an invalid operation fails (%" PRIx64 ")", resp);
+    resp = psc_ghcb(snp_pages + 4096, 1, 0);
+    CHECK(resp == 0, "GHCB PSC back to private (%" PRIx64 ")", resp);
+    rc = pvalidate(snp_pages + 4096, 0, 1, &nc);
+    CHECK(rc == 0 && nc == 0, "PVALIDATE after PSC to private (rc %d cf %d)", rc, nc);
+    resp = psc_ghcb((void *)0x7fffff000000ULL, 2, 0);
+    CHECK(resp != 0, "GHCB PSC outside guest RAM fails (%" PRIx64 ")", resp);
+    resp = psc_ghcb(snp_pages + 3 * 4096, 2, 1);
+    CHECK(resp != 0, "GHCB PSC of a misaligned 2M entry fails (%" PRIx64 ")", resp);
+
+    /* RMPADJUST */
+    rc = rmpadjust(snp_pages + 2 * 4096, 0, 1 | (1 << 16));
+    CHECK(rc == 0, "RMPADJUST VMSA attribute for VMPL1 (rc %d)", rc);
+    rc = rmpadjust(snp_pages + 2 * 4096, 0, 0 | (1 << 16));
+    CHECK(rc == 2, "RMPADJUST for VMPL0 fails with permission (rc %d)", rc);
+    rc = rmpadjust(snp_pages + 2 * 4096 + 8, 0, 1);
+    CHECK(rc == 1, "RMPADJUST of an unaligned address fails (rc %d)", rc);
+
+    /* a guest request has no firmware behind it */
+    ghcb_clear(g);
+    ghcb_call(g, SVM_VMGEXIT_GUEST_REQUEST, (uint64_t)snp_pages, (uint64_t)snp_pages + 4096);
+    CHECK(g->sw_exit_info_1 == 0 && g->sw_exit_info_2 != 0,
+          "guest request fails cleanly (%" PRIx64 ")", g->sw_exit_info_2);
+
+    /* AP creation: the VMSA must carry the RMPADJUST attribute and SNP features */
+    {
+        uint8_t *vmsa = snp_vmsa + 4096;
+        uint64_t cr0, cr3, cr4;
+        uint16_t cs, ds;
+        if (((uint64_t)vmsa & 0x1fffff) == 0) {
+            vmsa += 4096;
+        }
+        for (int i = 0; i < 4096; i++) {
+            vmsa[i] = 0;
+        }
+        asm volatile("mov %%cs, %0" : "=r"(cs));
+        asm volatile("mov %%ds, %0" : "=r"(ds));
+        asm volatile("mov %%cr0, %0" : "=r"(cr0));
+        asm volatile("mov %%cr3, %0" : "=r"(cr3));
+        asm volatile("mov %%cr4, %0" : "=r"(cr4));
+        vmsa_seg(vmsa, 0x00, ds, 0xc93, 0xffffffff, 0);
+        vmsa_seg(vmsa, 0x10, cs, 0xa9b, 0xffffffff, 0);
+        vmsa_seg(vmsa, 0x20, ds, 0xc93, 0xffffffff, 0);
+        vmsa_seg(vmsa, 0x30, ds, 0xc93, 0xffffffff, 0);
+        vmsa_seg(vmsa, 0x70, 0, 0x82, 0xffff, 0);
+        vmsa_seg(vmsa, 0x90, 0, 0x8b, 0xffff, 0);
+        *(uint64_t *)(vmsa + 0xd0) = 0x1d00;
+        *(uint64_t *)(vmsa + 0x148) = cr4;
+        *(uint64_t *)(vmsa + 0x150) = cr3;
+        *(uint64_t *)(vmsa + 0x158) = cr0;
+        *(uint64_t *)(vmsa + 0x160) = 0x400;
+        *(uint64_t *)(vmsa + 0x168) = 0xffff0ff0;
+        *(uint64_t *)(vmsa + 0x170) = 0x2;
+        *(uint64_t *)(vmsa + 0x178) = (uint64_t)ap_entry;
+        *(uint64_t *)(vmsa + 0x1d8) = (uint64_t)&ap_stack[511];
+        *(uint64_t *)(vmsa + 0x268) = 0x0007040600070406ULL;
+        *(uint64_t *)(vmsa + 0x3b0) = 1;              /* sev_features: SNP active */
+        *(uint64_t *)(vmsa + 0x3e8) = 1;
+        *(uint32_t *)(vmsa + 0x408) = 0x1f80;
+        *(uint16_t *)(vmsa + 0x410) = 0x37f;
+        ghcb_clear(g);
+        GHCB_SET(g, rax, 1);
+        ghcb_call(g, SVM_VMGEXIT_AP_CREATION, (1ULL << 32) | 1, (uint64_t)vmsa);
+        CHECK(g->sw_exit_info_1 == 2, "AP creation without RMPADJUST VMSA refused");
+        rc = rmpadjust(vmsa, 0, 1 | (1 << 16));
+        ghcb_clear(g);
+        GHCB_SET(g, rax, 0);
+        ghcb_call(g, SVM_VMGEXIT_AP_CREATION, (1ULL << 32) | 1, (uint64_t)vmsa);
+        CHECK(g->sw_exit_info_1 == 2, "AP creation without the SNP feature refused");
+        ghcb_clear(g);
+        GHCB_SET(g, rax, 1);
+        ghcb_call(g, SVM_VMGEXIT_AP_CREATION, (1ULL << 32) | 1, (uint64_t)vmsa);
+        CHECK(g->sw_exit_info_1 == 0 && rc == 0, "AP creation accepted");
+        for (int i = 0; i < 100000000 && !ap_started; i++) {
+            asm volatile("pause");
+        }
+        CHECK(ap_started, "AP started from the SNP VMSA");
+    }
+
+    ml_printf("#VC counts: cpuid %u msr %u ioio %u page-not-validated %u unexpected %u (last %" PRIx64 ")\n",
+              vc_counts[1], vc_counts[2], vc_counts[3], vc_counts[14], vc_unexpected, vc_last_unexpected);
+    CHECK(vc_unexpected == 0, "no unexpected #VC");
+    ml_printf("sev-snp: %s\n", failures ? "FAILED" : "PASSED");
+    if (failures) {
+        return 1;
+    }
+    ghcb_msr_protocol(GHCB_MSR_TERM_REQ);
+    return 0;
+}
+#elif defined(SEV_ES_TERM_TEST)
+/* the termination request ends the VM: the harness sees QEMU exit, not a timeout */
+int main(void)
+{
+    idt_init();
+    ml_printf("sev-es-term: requesting termination\n");
+    ghcb_msr_protocol(GHCB_MSR_TERM_REQ | (0ULL << 12) | (0x7bULL << 16));
+    /* not reached when the hypervisor terminates the guest */
+    for (;;) {
+        asm volatile("pause");
+    }
+}
+#else
 int main(void)
 {
     struct ghcb *g = &ghcb_page;
@@ -657,17 +933,5 @@ int main(void)
     /* no firmware programmed the ACPI ports: an SEV-ES guest ends with a termination request */
     ghcb_msr_protocol(GHCB_MSR_TERM_REQ);
     return 0;
-}
-#else
-/* the termination request ends the VM: the harness sees QEMU exit, not a timeout */
-int main(void)
-{
-    idt_init();
-    ml_printf("sev-es-term: requesting termination\n");
-    ghcb_msr_protocol(GHCB_MSR_TERM_REQ | (0ULL << 12) | (0x7bULL << 16));
-    /* not reached when the hypervisor terminates the guest */
-    for (;;) {
-        asm volatile("pause");
-    }
 }
 #endif

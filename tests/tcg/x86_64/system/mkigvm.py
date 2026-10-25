@@ -23,6 +23,11 @@ VHT_PAGE_DATA = 0x302
 VHT_VP_CONTEXT = 0x304
 PLATFORM = {'sev': 4, 'sev-es': 5, 'snp': 2}
 VMSA_GPA = 0xFFFFFFFFF000
+# the SNP secrets and CPUID pages, above the test image (sev-es.c reads them)
+SNP_SECRETS_GPA = 0x3fe000
+SNP_CPUID_GPA = 0x3ff000
+PAGE_DATA_SECRETS = 1
+PAGE_DATA_CPUID = 2
 
 
 def symbol(data, shoff, shentsize, shnum, name):
@@ -113,7 +118,8 @@ def main():
     page_hdr = len(vheader(VHT_PAGE_DATA, bytes(24)))
     vp_hdr = len(vheader(VHT_VP_CONTEXT, bytes(20)))
     with_vmsa = args.platform != 'sev'
-    data_start = 24 + len(headers) + len(pages) * page_hdr + (vp_hdr if with_vmsa else 0)
+    extra = 2 if args.platform == 'snp' else 0
+    data_start = 24 + len(headers) + (len(pages) + extra) * page_hdr + (vp_hdr if with_vmsa else 0)
     file_data = bytearray()
     for gpa in sorted(pages):
         page = bytes(pages[gpa])
@@ -123,6 +129,9 @@ def main():
         else:
             off = 0
         headers += vheader(VHT_PAGE_DATA, struct.pack('<QIIIHH', gpa, mask, off, 0, 0, 0))
+    if args.platform == 'snp':
+        for gpa, typ in ((SNP_SECRETS_GPA, PAGE_DATA_SECRETS), (SNP_CPUID_GPA, PAGE_DATA_CPUID)):
+            headers += vheader(VHT_PAGE_DATA, struct.pack('<QIIIHH', gpa, mask, 0, 0, typ, 0))
     if with_vmsa:
         off = data_start + len(file_data)
         file_data += vmsa(entry, args.platform == 'snp')
