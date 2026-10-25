@@ -24,18 +24,18 @@
 #define sev_enabled() 0
 #define sev_es_enabled() 0
 #define sev_snp_enabled() 0
-#define sev_emulated_enabled() 0
+#define sev_emu_enabled() 0
 #else
 bool sev_enabled(void);
 bool sev_es_enabled(void);
 bool sev_snp_enabled(void);
-bool sev_emulated_enabled(void);
+bool sev_emu_enabled(void);
 #endif
 
 #if !defined(CONFIG_USER_ONLY)
 
 #define TYPE_SEV_COMMON "sev-common"
-#define TYPE_SEV_EMULATED "sev-emulated"
+#define TYPE_SEV_EMU "sev-emu"
 #define TYPE_SEV_GUEST "sev-guest"
 #define TYPE_SEV_SNP_GUEST "sev-snp-guest"
 
@@ -199,6 +199,6 @@ void pc_system_parse_sev_metadata(uint8_t *flash_ptr, size_t flash_size);
 
 uint32_t sev_get_cbit_position(void);
 uint32_t sev_get_reduced_phys_bits(void);
-uint64_t sev_emulated_convert_pte(uint64_t);
+uint64_t sev_emu_convert_pte(uint64_t);
 
 #endif

@@ -164,7 +164,7 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
 #ifdef CONFIG_SEV
     rsvd_mask = ~MAKE_64BIT_MASK(0,
         env_archcpu(env)->phys_bits - sev_get_reduced_phys_bits());
-    rsvd_mask = sev_emulated_convert_pte(rsvd_mask);
+    rsvd_mask = sev_emu_convert_pte(rsvd_mask);
 #else
     rsvd_mask = ~MAKE_64BIT_MASK(0, env_archcpu(env)->phys_bits);
 #endif
@@ -187,7 +187,7 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
             restart_5:
                 pte = ptw_ldq(&pte_trans, ra);
             #ifdef CONFIG_SEV
-                pte = sev_emulated_convert_pte(pte);
+                pte = sev_emu_convert_pte(pte);
             #endif
                 if (!(pte & PG_PRESENT_MASK)) {
                     goto do_fault;
@@ -214,7 +214,7 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
         restart_4:
             pte = ptw_ldq(&pte_trans, ra);
         #ifdef CONFIG_SEV
-            pte = sev_emulated_convert_pte(pte);
+            pte = sev_emu_convert_pte(pte);
         #endif
             if (!(pte & PG_PRESENT_MASK)) {
                 goto do_fault;
@@ -237,7 +237,7 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
         restart_3_lma:
             pte = ptw_ldq(&pte_trans, ra);
         #ifdef CONFIG_SEV
-            pte = sev_emulated_convert_pte(pte);
+            pte = sev_emu_convert_pte(pte);
         #endif
             if (!(pte & PG_PRESENT_MASK)) {
                 goto do_fault;
@@ -268,7 +268,7 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
         restart_3_nolma:
             pte = ptw_ldq(&pte_trans, ra);
         #ifdef CONFIG_SEV
-            pte = sev_emulated_convert_pte(pte);
+            pte = sev_emu_convert_pte(pte);
         #endif
             if (!(pte & PG_PRESENT_MASK)) {
                 goto do_fault;
@@ -292,7 +292,7 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
     restart_2_pae:
         pte = ptw_ldq(&pte_trans, ra);
     #ifdef CONFIG_SEV
-        pte = sev_emulated_convert_pte(pte);
+        pte = sev_emu_convert_pte(pte);
     #endif
         if (!(pte & PG_PRESENT_MASK)) {
             goto do_fault;
@@ -320,7 +320,7 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
         }
         pte = ptw_ldq(&pte_trans, ra);
     #ifdef CONFIG_SEV
-        pte = sev_emulated_convert_pte(pte);
+        pte = sev_emu_convert_pte(pte);
     #endif
         if (!(pte & PG_PRESENT_MASK)) {
             goto do_fault;
@@ -342,7 +342,7 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
     restart_2_nopae:
         pte = ptw_ldl(&pte_trans, ra);
     #ifdef CONFIG_SEV
-        pte = sev_emulated_convert_pte(pte);
+        pte = sev_emu_convert_pte(pte);
     #endif
         if (!(pte & PG_PRESENT_MASK)) {
             goto do_fault;
@@ -373,7 +373,7 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
         }
         pte = ptw_ldl(&pte_trans, ra);
     #ifdef CONFIG_SEV
-        pte = sev_emulated_convert_pte(pte);
+        pte = sev_emu_convert_pte(pte);
     #endif
         if (!(pte & PG_PRESENT_MASK)) {
             goto do_fault;

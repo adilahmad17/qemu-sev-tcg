@@ -1066,18 +1066,23 @@
             '*legacy-vm-type': 'OnOffAuto' } }
 
 ##
-# @SevEmulatedProperties:
+# @SevEmuProperties:
 #
-# Properties for sev-emulated objects.
-# This object functionally emulates AMD SEV hardware via TCG, so
-# it does not require real hardware to run.
+# Properties for sev-emu objects: a functional emulation of an AMD SEV
+# guest for the TCG accelerator (no encryption, no firmware).
 #
-# @tik: binary file of the SEV TIK (default: all 0).
-# Since: 10.1.0
+# @policy: SEV policy value (default: 0)
+#
+# @tik: path to the binary file containing the 16-byte Transport
+#     Integrity Key that keys the emulated launch measurement
+#     (default: all zero)
+#
+# Since: 11.1
 ##
-{ 'struct': 'SevEmulatedProperties',
-  'base': 'SevGuestProperties',
-  'data': {'*tik': 'str'}}
+{ 'struct': 'SevEmuProperties',
+  'base': 'SevCommonProperties',
+  'data': { '*policy': 'uint32',
+            '*tik': 'str' } }
 
 ##
 # @SevSnpGuestProperties:
@@ -1323,8 +1328,8 @@
     'secret',
     { 'name': 'secret_keyring',
       'if': 'CONFIG_SECRET_KEYRING' },
+    'sev-emu',
     'sev-guest',
-    'sev-emulated',
     'sev-snp-guest',
     'thread-context',
     's390-pv-guest',
@@ -1403,8 +1408,8 @@
       'secret':                     'SecretProperties',
       'secret_keyring':             { 'type': 'SecretKeyringProperties',
                                       'if': 'CONFIG_SECRET_KEYRING' },
+      'sev-emu':                    'SevEmuProperties',
       'sev-guest':                  'SevGuestProperties',
-      'sev-emulated':               'SevEmulatedProperties',
       'sev-snp-guest':              'SevSnpGuestProperties',
       'tdx-guest':                  'TdxGuestProperties',
       'thread-context':             'ThreadContextProperties',

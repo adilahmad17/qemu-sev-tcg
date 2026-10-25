@@ -93,7 +93,7 @@ void helper_write_crN(CPUX86State *env, int reg, target_ulong t0)
     case 3:
     #ifdef CONFIG_SEV
         /* If SEV emulation is active, reset the C-bit */
-        t0 = sev_emulated_convert_pte(t0);
+        t0 = sev_emu_convert_pte(t0);
     #endif
         if ((env->efer & MSR_EFER_LMA) &&
                 (t0 & ((~0ULL) << env_archcpu(env)->phys_bits))) {
@@ -475,7 +475,7 @@ void helper_rdmsr(CPUX86State *env)
         val = x86_cpu->ucode_rev;
         break;
     case MSR_AMD64_SEV:
-        if (sev_emulated_enabled()) {
+        if (sev_emu_enabled()) {
             val = 1;
         } else {
             /* XXX: exception? */

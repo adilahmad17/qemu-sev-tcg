@@ -9532,6 +9532,10 @@ static void x86_cpu_reset_hold(Object *obj, ResetType type)
         qigvm_x86_bsp_reset(env);
     }
 #endif
+    if (tcg_enabled()) {
+        /* an initial VMSA of an emulated SEV-ES guest (KVM does this in kvm_arch_reset_vcpu) */
+        sev_es_set_reset_vector(cs);
+    }
 
     if (kvm_enabled()) {
         kvm_arch_reset_vcpu(cpu);

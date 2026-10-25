@@ -53,7 +53,7 @@
 
 OBJECT_DECLARE_TYPE(SevCommonState, SevCommonStateClass, SEV_COMMON)
 OBJECT_DECLARE_TYPE(SevGuestState, SevCommonStateClass, SEV_GUEST)
-OBJECT_DECLARE_TYPE(SevEmulatedState, SevCommonStateClass, SEV_EMULATED)
+OBJECT_DECLARE_TYPE(SevEmuState, SevCommonStateClass, SEV_EMU)
 OBJECT_DECLARE_TYPE(SevSnpGuestState, SevCommonStateClass, SEV_SNP_GUEST)
 
 /* hard code sha256 digest size */
@@ -68,7 +68,7 @@ OBJECT_DECLARE_TYPE(SevSnpGuestState, SevCommonStateClass, SEV_SNP_GUEST)
 #define FLAGS_SEGCACHE_TO_VMSA(flags) \
     ((((flags) & 0xff00) >> 8) | (((flags) & 0xf00000) >> 12))
 
-/* SEV-EMULATED default values */
+/* sev-emu default values */
 #define INVALID_FD -1
 #define FAKE_BUILD_ID 40
 #define FAKE_API_MAJOR 1
@@ -186,9 +186,9 @@ struct SevGuestState {
 };
 
 /**
- * SevEmulatedState:
+ * SevEmuState:
  *
- * The SevEmulatedState object is used for creating and managing a SEV emulated
+ * The SevEmuState object is used for creating and managing a SEV emulated
  * guest.
  *
  * # $QEMU \
@@ -196,11 +196,22 @@ struct SevGuestState {
  *         -machine ...,memory-encryption=sev0
  */
 
-typedef struct SevEmulatedState {
-    SevGuestState parent_obj;
+/*
+ * SevEmuState:
+ *
+ * The emulated SEV guest of QEMU TCG (sev-emu): the guest sees SEV in
+ * CPUID and SEV_STATUS and its page tables may carry the C-bit, but no
+ * memory is encrypted and no firmware exists. It is a functional model
+ * for testing SEV-aware guests on hosts without the hardware.
+ */
+typedef struct SevEmuState {
+    SevCommonState parent_obj;
+
+    uint32_t policy;
+    char *measurement;
     uint8_t *tik;
     QEMUIOVector ld_data;
-} SevEmulatedState;
+} SevEmuState;
 
 struct SevSnpGuestState {
     SevCommonState parent_obj;
@@ -700,11 +711,11 @@ static int sev_set_cpu_context(uint16_t cpu_index, const void *ctx,
 }
 
 bool
-sev_emulated_enabled(void)
+sev_emu_enabled(void)
 {
    ConfidentialGuestSupport *cgs = MACHINE(qdev_get_machine())->cgs;
 
-   return !!object_dynamic_cast(OBJECT(cgs), TYPE_SEV_EMULATED);
+   return !!object_dynamic_cast(OBJECT(cgs), TYPE_SEV_EMU);
 }
 
 bool
@@ -728,8 +739,13 @@ sev_es_enabled(void)
 {
     ConfidentialGuestSupport *cgs = MACHINE(qdev_get_machine())->cgs;
 
-    return sev_snp_enabled() ||
-            (sev_enabled() && SEV_GUEST(cgs)->policy & SEV_POLICY_ES);
+    if (sev_snp_enabled()) {
+        return true;
+    }
+    if (sev_emu_enabled()) {
+        return SEV_EMU(cgs)->policy & SEV_POLICY_ES;
+    }
+    return sev_enabled() && SEV_GUEST(cgs)->policy & SEV_POLICY_ES;
 }
 
 uint32_t
@@ -749,9 +765,9 @@ sev_get_reduced_phys_bits(void)
 }
 
 uint64_t
-sev_emulated_convert_pte(uint64_t pte)
+sev_emu_convert_pte(uint64_t pte)
 {
-    if (unlikely(sev_emulated_enabled())) {
+    if (unlikely(sev_emu_enabled())) {
         pte &= ~(1ULL << sev_get_cbit_position());
     }
 
@@ -778,7 +794,9 @@ static SevInfo *sev_get_info(void)
                 object_property_get_uint(OBJECT(sev_common), "policy", NULL);
         } else {
             info->sev_type = SEV_GUEST_TYPE_SEV;
-            info->u.sev.handle = SEV_GUEST(sev_common)->handle;
+            if (object_dynamic_cast(OBJECT(sev_common), TYPE_SEV_GUEST)) {
+                info->u.sev.handle = SEV_GUEST(sev_common)->handle;
+            }
             info->u.sev.policy =
                 (uint32_t)object_property_get_uint(OBJECT(sev_common),
                                                    "policy", NULL);
@@ -924,7 +942,7 @@ static SevCapability *sev_get_capabilities(Error **errp)
     SevCommonState *sev_common;
     char *sev_device;
 
-    if (sev_emulated_enabled()) {
+    if (sev_emu_enabled()) {
         error_setg(errp, "SEV emulation does not support"
                                     "returning capabilities");
         return NULL;
@@ -1039,7 +1057,7 @@ static SevAttestationReport *sev_get_attestation_report(const char *mnonce,
         return NULL;
     }
 
-    if (sev_emulated_enabled()) {
+    if (sev_emu_enabled()) {
         error_setg(errp, "SEV emulation does not support"
                                     "attestation report");
         return NULL;
@@ -1434,11 +1452,10 @@ sev_launch_get_measure(Notifier *notifier, void *unused)
 }
 
 static void
-sev_emulated_launch_get_measure(Notifier *notifier, void *unused)
+sev_emu_launch_get_measure(Notifier *notifier, void *unused)
 {
     SevCommonState *sev_common = SEV_COMMON(MACHINE(qdev_get_machine())->cgs);
-    SevGuestState *sev_guest = SEV_GUEST(sev_common);
-    SevEmulatedState *sev_emulated = SEV_EMULATED(sev_guest);
+    SevEmuState *sev_emu = SEV_EMU(sev_common);
 
     uint8_t prefix = 0x04;
     uint8_t concat_data[56];
@@ -1461,8 +1478,8 @@ sev_emulated_launch_get_measure(Notifier *notifier, void *unused)
     }
 
     /* Compute the Launch Digest (ld) */
-    if (qcrypto_hash_bytesv(QCRYPTO_HASH_ALGO_SHA256, sev_emulated->ld_data.iov,
-                        sev_emulated->ld_data.niov, &ld, &ld_len, &err) < 0){
+    if (qcrypto_hash_bytesv(QCRYPTO_HASH_ALGO_SHA256, sev_emu->ld_data.iov,
+                        sev_emu->ld_data.niov, &ld, &ld_len, &err) < 0){
         error_report_err(err);
         return;
     }
@@ -1477,7 +1494,7 @@ sev_emulated_launch_get_measure(Notifier *notifier, void *unused)
     concat_data[1] = sev_common->api_major;
     concat_data[2] = sev_common->api_minor;
     concat_data[3] = sev_common->build_id;
-    memcpy(&concat_data[4],  &sev_guest->policy, 4);
+    memcpy(&concat_data[4],  &sev_emu->policy, 4);
     memcpy(&concat_data[8],  ld, ld_len);
     memcpy(&concat_data[40], mnonce, 16);
 
@@ -1485,7 +1502,7 @@ sev_emulated_launch_get_measure(Notifier *notifier, void *unused)
 
     /* Initialize HMAC with TIK */
     hmac = qcrypto_hmac_new(QCRYPTO_HASH_ALGO_SHA256,
-                            (uint8_t *)sev_emulated->tik,
+                            (uint8_t *)sev_emu->tik,
                             TEK_TIK_IV_SIZE,
                             &err);
     if (!hmac) {
@@ -1509,7 +1526,8 @@ sev_emulated_launch_get_measure(Notifier *notifier, void *unused)
 
     g_free(hmac_raw);
 
-    sev_guest->measurement =
+    g_free(sev_emu->measurement);
+    sev_emu->measurement =
             g_base64_encode(measure_raw->data, measure_raw->len);
     g_byte_array_free(measure_raw, TRUE);
 
@@ -1525,6 +1543,10 @@ static char *sev_get_launch_measurement(void)
     if (sev_guest &&
         SEV_COMMON(sev_guest)->state >= SEV_STATE_LAUNCH_SECRET) {
         return g_strdup(sev_guest->measurement);
+    }
+    if (sev_emu_enabled() &&
+        SEV_COMMON(cgs)->state >= SEV_STATE_LAUNCH_SECRET) {
+        return g_strdup(SEV_EMU(cgs)->measurement);
     }
 
     return NULL;
@@ -1552,8 +1574,18 @@ static Notifier sev_machine_done_notify = {
 };
 
 static Notifier sev_emu_machine_done_notify = {
-    .notify = sev_emulated_launch_get_measure,
+    .notify = sev_emu_launch_get_measure,
 };
+
+/* the launch measurement of the configured object type (plain SEV only) */
+static void sev_launch_get_measure_any(void)
+{
+    if (sev_emu_enabled()) {
+        sev_emu_launch_get_measure(NULL, NULL);
+    } else {
+        sev_launch_get_measure(NULL, NULL);
+    }
+}
 
 static void
 sev_launch_finish(SevCommonState *sev_common)
@@ -1815,7 +1847,7 @@ sev_vm_state_change(void *opaque, bool running, RunState state)
              * its LAUNCH_UPDATE_DATA calls (no-op if already measured).
              */
             if (!sev_snp_enabled()) {
-                sev_launch_get_measure(NULL, NULL);
+                sev_launch_get_measure_any();
             }
             klass->launch_finish(sev_common);
 
@@ -1868,20 +1900,6 @@ static int sev_kvm_type(X86ConfidentialGuest *cg)
      */
     kvm_type = (sev_guest->policy & SEV_POLICY_ES) ?
                 KVM_X86_SEV_ES_VM : KVM_X86_SEV_VM;
-
-    /*
-     * If we are in emulated mode, force the legacy VM type as the only
-     * actively supported option.
-     */
-    if (sev_emulated_enabled()) {
-        if (kvm_type != KVM_X86_DEFAULT_VM) {
-            warn_report("Only legacy VM are supported in emulated mode:"
-            " using KVM_X86_DEFAULT_VM");
-            kvm_type = KVM_X86_DEFAULT_VM;
-        }
-        sev_common->kvm_type = kvm_type;
-        goto out;
-    }
 
     if (!kvm_is_vm_type_supported(kvm_type)) {
         if (sev_guest->legacy_vm_type == ON_OFF_AUTO_AUTO) {
@@ -2184,7 +2202,7 @@ static void sev_handle_reset(Object *obj, ResetType type)
 
     sev_add_kernel_loader_hashes(&sev_load_ctx, &error_fatal);
     if (sev_es_enabled() && !sev_snp_enabled()) {
-        sev_launch_get_measure(NULL, NULL);
+        sev_launch_get_measure_any();
     }
     if (!sev_check_state(sev_common, SEV_STATE_RUNNING)) {
         /* this calls sev_snp_launch_finish() etc */
@@ -2787,6 +2805,10 @@ static int cgs_set_guest_state(hwaddr gpa, uint8_t *ptr, uint64_t len,
                                       KVM_SEV_SNP_PAGE_TYPE_SECRETS, errp);
 
     case CGS_PAGE_TYPE_REQUIRED_MEMORY:
+        if (!kvm_enabled()) {
+            /* emulated guests have no private memory to convert */
+            return 0;
+        }
         if (kvm_convert_memory(gpa, len, true) < 0) {
             error_setg(
                 errp,
@@ -3115,13 +3137,22 @@ sev_guest_instance_init(Object *obj)
     sev_guest->legacy_vm_type = ON_OFF_AUTO_AUTO;
 }
 
-static int sev_emulated_init(ConfidentialGuestSupport *cgs, Error **errp)
+static int sev_emu_init(ConfidentialGuestSupport *cgs, Error **errp)
 {
     SevCommonState *sev_common = SEV_COMMON(cgs);
-    SevGuestState *sev_guest = SEV_GUEST(sev_common);
-    SevEmulatedState *sev_emulated = SEV_EMULATED(sev_guest);
+    SevEmuState *sev_emu = SEV_EMU(sev_common);
+    MachineState *machine = MACHINE(qdev_get_machine());
+    X86MachineState *x86machine = X86_MACHINE(machine);
+
+    if (!tcg_enabled()) {
+        error_setg(errp, "%s: the emulated SEV guest needs the TCG accelerator",
+                   __func__);
+        return -1;
+    }
 
     sev_common->state = SEV_STATE_UNINIT;
+    /* what the emulated firmware accepts in a VMSA's sev_features */
+    sev_common->supported_sev_features = SVM_SEV_FEAT_SNP_ACTIVE;
 
     /*
      * The cbitpos value will be placed in bit positions 5:0 of the EBX
@@ -3149,6 +3180,18 @@ static int sev_emulated_init(ConfidentialGuestSupport *cgs, Error **errp)
         return -1;
     }
     /*
+     * An IGVM file may carry the initial VMSA, whose sev_features the launch
+     * checks: pre-process it as sev_common_kvm_init() does (the cgs_*
+     * callbacks see SEV_STATE_UNINIT and only record the features).
+     */
+    if (x86machine->igvm) {
+        if (IGVM_CFG_GET_CLASS(x86machine->igvm)
+                ->process(x86machine->igvm, machine, true, errp) == -1) {
+            return -1;
+        }
+    }
+
+    /*
      * The device does not exist so we initialize the values as default.
      * We can skip to SEV_STATE_LAUNCH_UPDATE as there is nothing to encrypt.
      * This avoids the launch start call.
@@ -3160,37 +3203,39 @@ static int sev_emulated_init(ConfidentialGuestSupport *cgs, Error **errp)
     sev_common->api_minor = FAKE_API_MINOR;
 
     /* Initialize the iovec for the measurements blobs */
-    qemu_iovec_init(&sev_emulated->ld_data, 3);
+    qemu_iovec_init(&sev_emu->ld_data, 3);
 
     qemu_add_vm_change_state_handler(sev_vm_state_change, sev_common);
 
     cgs->ready = true;
 
-    qemu_add_machine_init_done_notifier(&sev_emu_machine_done_notify);
+    if (!x86machine->igvm) {
+        qemu_add_machine_init_done_notifier(&sev_emu_machine_done_notify);
+    }
 
     return 0;
 }
 
-static int sev_emulated_launch_update_data(SevCommonState *sev_common,
+static int sev_emu_launch_update_data(SevCommonState *sev_common,
         hwaddr gpa, uint8_t *addr, size_t len, Error **errp)
 {
-    SevEmulatedState *sev_emulated = SEV_EMULATED(sev_common);
+    SevEmuState *sev_emu = SEV_EMU(sev_common);
 
     if (!addr || !len) {
         return 1;
     }
-    qemu_iovec_add(&sev_emulated->ld_data, addr, len);
+    qemu_iovec_add(&sev_emu->ld_data, addr, len);
 
     return 0;
 }
 
 static void
-sev_emulated_launch_finish(SevCommonState *sev_common)
+sev_emu_launch_finish(SevCommonState *sev_common)
 {
     sev_set_guest_state(sev_common, SEV_STATE_RUNNING);
 }
 
-static void sev_emulated_read_key(uint8_t *key,
+static void sev_emu_read_key(uint8_t *key,
                                 const char *key_filename, Error **errp)
 {
     gsize len;
@@ -3213,49 +3258,69 @@ static void sev_emulated_read_key(uint8_t *key,
     }
 }
 
-static char *sev_emulated_get_tik(Object *obj, Error **errp)
+static char *sev_emu_get_tik(Object *obj, Error **errp)
 {
-    SevEmulatedState *sev_emulated = SEV_EMULATED(obj);
+    SevEmuState *sev_emu = SEV_EMU(obj);
 
-    return g_memdup2(sev_emulated->tik, TEK_TIK_IV_SIZE);
+    return g_memdup2(sev_emu->tik, TEK_TIK_IV_SIZE);
 }
 
-static void sev_emulated_set_tik(
+static void sev_emu_set_tik(
             Object *obj, const char *key_filename, Error **errp)
 {
-    SevEmulatedState *sev_emulated = SEV_EMULATED(obj);
+    SevEmuState *sev_emu = SEV_EMU(obj);
 
-    sev_emulated_read_key(
-        sev_emulated->tik,
+    sev_emu_read_key(
+        sev_emu->tik,
         key_filename,
         errp
     );
 }
 
-static void sev_emulated_class_init(ObjectClass *oc, const void *data)
+static int sev_emu_kvm_type(X86ConfidentialGuest *cg)
+{
+    /* never used for a VM: TCG only */
+    return KVM_X86_DEFAULT_VM;
+}
+
+static void sev_emu_class_init(ObjectClass *oc, const void *data)
 {
     SevCommonStateClass *scc = SEV_COMMON_CLASS(oc);
     ConfidentialGuestSupportClass *klass = CONFIDENTIAL_GUEST_SUPPORT_CLASS(oc);
+    X86ConfidentialGuestClass *x86_klass = X86_CONFIDENTIAL_GUEST_CLASS(oc);
+
     /* Override the sev-common methods that use kvm */
-    klass->kvm_init = sev_emulated_init;
-    scc->launch_update_data = sev_emulated_launch_update_data;
-    scc->launch_finish = sev_emulated_launch_finish;
+    klass->kvm_init = sev_emu_init;
+    x86_klass->kvm_type = sev_emu_kvm_type;
+    scc->launch_update_data = sev_emu_launch_update_data;
+    scc->launch_finish = sev_emu_launch_finish;
 
     /* Adding emulation specific property */
     object_class_property_add_str(oc, "tik",
-                                sev_emulated_get_tik,
-                                sev_emulated_set_tik);
+                                sev_emu_get_tik,
+                                sev_emu_set_tik);
     object_class_property_set_description(oc, "tik",
         "Path to the binary file containing the"
                                 "SEV Transport Integrity Key (16 bytes)");
 }
 
-static void sev_emulated_instance_init(Object *obj)
+static void sev_emu_instance_init(Object *obj)
 {
-    SevEmulatedState *sev_emulated = SEV_EMULATED(obj);
+    SevEmuState *sev_emu = SEV_EMU(obj);
 
+    object_property_add_uint32_ptr(obj, "policy", &sev_emu->policy,
+                                   OBJ_PROP_FLAG_READWRITE);
     /* Initialize the key for emulation */
-    sev_emulated->tik = g_malloc0(TEK_TIK_IV_SIZE);
+    sev_emu->tik = g_malloc0(TEK_TIK_IV_SIZE);
+}
+
+static void sev_emu_finalize(Object *obj)
+{
+    SevEmuState *sev_emu = SEV_EMU(obj);
+
+    g_free(sev_emu->tik);
+    g_free(sev_emu->measurement);
+    qemu_iovec_destroy(&sev_emu->ld_data);
 }
 
 static void
@@ -3279,12 +3344,13 @@ static const TypeInfo sev_guest_info = {
 };
 
 /* emulated sev */
-static const TypeInfo sev_emulated_info = {
-    .parent = TYPE_SEV_GUEST,
-    .name = TYPE_SEV_EMULATED,
-    .instance_size = sizeof(SevEmulatedState),
-    .instance_init = sev_emulated_instance_init,
-    .class_init = sev_emulated_class_init
+static const TypeInfo sev_emu_info = {
+    .parent = TYPE_SEV_COMMON,
+    .name = TYPE_SEV_EMU,
+    .instance_size = sizeof(SevEmuState),
+    .instance_init = sev_emu_instance_init,
+    .instance_finalize = sev_emu_finalize,
+    .class_init = sev_emu_class_init
 };
 
 static void
@@ -3563,7 +3629,7 @@ static void
 sev_register_types(void)
 {
     type_register_static(&sev_common_info);
-    type_register_static(&sev_emulated_info);
+    type_register_static(&sev_emu_info);
     type_register_static(&sev_guest_info);
     type_register_static(&sev_snp_guest_info);
 }

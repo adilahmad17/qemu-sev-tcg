@@ -181,11 +181,11 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
 #ifdef CONFIG_USER_ONLY
     qdev_create_fake_machine();
 #else
-    /* TCG SEV/Confidential Guest Support init */
+    /* emulated confidential guests (types named *-emu) initialize here */
     if (ms->cgs) {
         cgs_type = object_get_typename(OBJECT(ms->cgs));
 
-        if (g_str_has_prefix(cgs_type, "sev-emulated")) {
+        if (g_str_has_suffix(cgs_type, "-emu")) {
             ret = confidential_guest_kvm_init(ms->cgs, &local_err);
             if (ret < 0) {
                 error_report_err(local_err);
