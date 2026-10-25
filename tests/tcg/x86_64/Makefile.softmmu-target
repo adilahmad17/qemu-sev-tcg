@@ -34,6 +34,25 @@ memory: CFLAGS+=-DCHECK_UNALIGNED=1
 # Running
 QEMU_OPTS+=-device isa-debugcon,chardev=output -device isa-debug-exit,iobase=0xf4,iosize=0x4 -kernel
 
+# The emulated SEV-ES guest tests boot from an IGVM file (mkigvm.py wraps
+# the test ELF) as an sev-emu guest with the SEV-ES policy; they need a
+# QEMU built with IGVM support. The test binary that the generic rule appends
+# becomes the VM name.
+SEV_ES_TESTS=sev-es sev-es-term
+SEV_ES_QEMU_OPTS=-M q35,confidential-guest-support=sev0,igvm-cfg=igvm0 \
+	-object sev-emu,id=sev0,cbitpos=51,reduced-phys-bits=1,policy=0x5 \
+	-cpu max -smp 2 \
+	-device isa-debugcon,chardev=output -device isa-debug-exit,iobase=0xf4,iosize=0x4
+
+$(SEV_ES_TESTS): CFLAGS+=-mno-red-zone
+
+%.igvm: % $(X64_SYSTEM_SRC)/mkigvm.py
+	$(PYTHON) $(X64_SYSTEM_SRC)/mkigvm.py --platform sev-es $< $@
+
+$(foreach t,$(SEV_ES_TESTS),run-$(t)): run-%: %.igvm
+$(foreach t,$(SEV_ES_TESTS),run-$(t)): QEMU_OPTS=$(SEV_ES_QEMU_OPTS) -object igvm-cfg,id=igvm0,file=$<.igvm -name
+$(foreach t,$(SEV_ES_TESTS),run-plugin-$(t)-with-%): QEMU_OPTS=$(SEV_ES_QEMU_OPTS) -object igvm-cfg,id=igvm0,file=$(call strip-plugin,$<).igvm -name
+
 ifeq ($(CONFIG_PLUGIN),y)
 run-plugin-patch-target-with-libpatch.so:		\
 	PLUGIN_ARGS=$(COMMA)target=ffc0$(COMMA)patch=9090$(COMMA)use_hwaddr=true
