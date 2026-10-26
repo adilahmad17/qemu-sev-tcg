@@ -230,6 +230,10 @@ typedef struct SevSnpEmuState {
     SevCommonState parent_obj;
 
     uint64_t policy;
+
+    /* kernel-hashes=on: the table, placed in the firmware's area at launch */
+    uint32_t kernel_hashes_offset;
+    PaddedSevHashTable *kernel_hashes_data;
 } SevSnpEmuState;
 
 struct SevSnpGuestState {
@@ -2969,6 +2973,24 @@ static bool sev_snp_build_kernel_loader_hashes(SevCommonState *sev_common,
     return build_kernel_loader_hashes(sev_snp_guest->kernel_hashes_data, ctx, errp);
 }
 
+/*
+ * sev-snp-emu: as sev-snp-guest, keep the table until the launch places it in
+ * the firmware's kernel hashes page (sev_snp_emu_launch_metadata()).
+ */
+static bool sev_snp_emu_build_kernel_loader_hashes(SevCommonState *sev_common,
+                                                   SevHashTableDescriptor *area,
+                                                   SevKernelLoaderContext *ctx,
+                                                   Error **errp)
+{
+    SevSnpEmuState *sev_snp_emu = SEV_SNP_EMU(sev_common);
+
+    sev_snp_emu->kernel_hashes_offset = area->base & ~TARGET_PAGE_MASK;
+    g_free(sev_snp_emu->kernel_hashes_data);
+    sev_snp_emu->kernel_hashes_data = g_new0(PaddedSevHashTable, 1);
+    return build_kernel_loader_hashes(sev_snp_emu->kernel_hashes_data, ctx,
+                                      errp);
+}
+
 static bool sev_build_kernel_loader_hashes(SevCommonState *sev_common,
                                            SevHashTableDescriptor *area,
                                            SevKernelLoaderContext *ctx,
@@ -3614,9 +3636,51 @@ static int sev_emu_launch_update_data(SevCommonState *sev_common,
     return 0;
 }
 
+/*
+ * sev-snp-emu started with -bios: the pages the OVMF metadata describes, as
+ * snp_populate_metadata_pages() launches them for sev-snp-guest (an IGVM
+ * file lists these pages itself).
+ */
+static void sev_snp_emu_launch_metadata(SevSnpEmuState *sev_snp_emu)
+{
+    OvmfSevMetadata *metadata = pc_system_get_ovmf_sev_metadata_ptr();
+
+    if (!metadata) {
+        return;
+    }
+    for (int i = 0; i < metadata->num_desc; i++) {
+        OvmfSevMetadataDesc *desc = &metadata->descs[i];
+        g_autoptr(MemoryRegion) mr = NULL;
+        uint8_t *hva;
+
+        if (desc->type != SEV_DESC_TYPE_SNP_KERNEL_HASHES) {
+            continue;
+        }
+        hva = gpa2hva(&mr, desc->base, desc->len, NULL);
+        if (!hva) {
+            error_report("%s: no guest memory at 0x%x (0x%x bytes)",
+                         __func__, desc->base, desc->len);
+            exit(1);
+        }
+        memset(hva, 0, desc->len);
+        if (sev_snp_emu->kernel_hashes_data) {
+            assert(sev_snp_emu->kernel_hashes_offset +
+                   sizeof(*sev_snp_emu->kernel_hashes_data) <= desc->len);
+            memcpy(hva + sev_snp_emu->kernel_hashes_offset,
+                   sev_snp_emu->kernel_hashes_data,
+                   sizeof(*sev_snp_emu->kernel_hashes_data));
+        }
+        sev_snp_emu_pages_set(desc->base, desc->len,
+                              SNP_PAGE_PRIVATE | SNP_PAGE_VALIDATED);
+    }
+}
+
 static void
 sev_emu_launch_finish(SevCommonState *sev_common)
 {
+    if (sev_snp_enabled() && !X86_MACHINE(qdev_get_machine())->igvm) {
+        sev_snp_emu_launch_metadata(SEV_SNP_EMU(sev_common));
+    }
     sev_set_guest_state(sev_common, SEV_STATE_RUNNING);
 }
 
@@ -3679,6 +3743,7 @@ static void sev_emu_class_init(ObjectClass *oc, const void *data)
     x86_klass->kvm_type = sev_emu_kvm_type;
     scc->launch_update_data = sev_emu_launch_update_data;
     scc->launch_finish = sev_emu_launch_finish;
+    scc->build_kernel_loader_hashes = sev_build_kernel_loader_hashes;
 
     /* Adding emulation specific property */
     object_class_property_add_str(oc, "tik",
@@ -3747,6 +3812,12 @@ static void sev_snp_emu_class_init(ObjectClass *oc, const void *data)
     x86_klass->kvm_type = sev_emu_kvm_type;
     scc->launch_update_data = sev_emu_launch_update_data;
     scc->launch_finish = sev_emu_launch_finish;
+    scc->build_kernel_loader_hashes = sev_snp_emu_build_kernel_loader_hashes;
+}
+
+static void sev_snp_emu_finalize(Object *obj)
+{
+    g_free(SEV_SNP_EMU(obj)->kernel_hashes_data);
 }
 
 /* emulated sev-snp */
@@ -3755,6 +3826,7 @@ static const TypeInfo sev_snp_emu_info = {
     .name = TYPE_SEV_SNP_EMU,
     .instance_size = sizeof(SevSnpEmuState),
     .instance_init = sev_snp_emu_instance_init,
+    .instance_finalize = sev_snp_emu_finalize,
     .class_init = sev_snp_emu_class_init
 };
 
