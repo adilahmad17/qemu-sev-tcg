@@ -3611,6 +3611,13 @@ static int sev_emu_init(ConfidentialGuestSupport *cgs, Error **errp)
             return -1;
         }
     }
+    /*
+     * As KVM does, the VMSAs of an SNP guest have SNP_ACTIVE whether or not
+     * an IGVM file gave an initial VMSA: the AP creation requests check it.
+     */
+    if (sev_emu_snp_flag) {
+        sev_common->sev_features |= SVM_SEV_FEAT_SNP_ACTIVE;
+    }
 
     /*
      * The device does not exist so we initialize the values as default.
