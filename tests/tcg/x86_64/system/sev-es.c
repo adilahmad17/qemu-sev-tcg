@@ -254,17 +254,71 @@ static unsigned vc_class(uint64_t code)
     }
 }
 
+#define IOIO_SIZE(size) ((size) == 1 ? 1 << 4 : (size) == 2 ? 1 << 5 : 1 << 6)
+#define IOIO_INFO(port, size, in, str, rep) \
+    (((uint64_t)(port) << 16) | (1 << 9) | IOIO_SIZE(size) | \
+     ((rep) ? 1 << 3 : 0) | ((str) ? 1 << 2 : 0) | ((in) ? 1 : 0))
+
+/*
+ * INS and OUTS: the elements go through the GHCB shared buffer in the order
+ * the instruction accesses them; the handler moves RSI/RDI by the direction
+ * flag. Returns nonzero when the hypervisor refuses an event.
+ */
+static int vc_string_io(struct vc_regs *r, uint8_t op, int rep, int opsize16)
+{
+    struct ghcb *g = &ghcb_page;
+    unsigned size = (op & 1) ? (opsize16 ? 2 : 4) : 1;
+    int in = !(op & 2);
+    uint16_t port = (uint16_t)r->rdx;
+    uint64_t count = rep ? r->rcx : 1;
+    int64_t step = (r->rflags & (1 << 10)) ? -(int64_t)size : (int64_t)size;
+    uint64_t max = sizeof(g->shared_buffer) / size;
+
+    while (count) {
+        uint64_t n = count < max ? count : max;
+        ghcb_clear(g);
+        if (!in) {
+            for (uint64_t i = 0; i < n * size; i++) {
+                g->shared_buffer[i] = ((uint8_t *)r->rsi)[i % size];
+                if (i % size == size - 1) {
+                    r->rsi += step;
+                }
+            }
+        }
+        GHCB_SET(g, sw_scratch, (uint64_t)g->shared_buffer);
+        if (ghcb_call(g, SVM_EXIT_IOIO, IOIO_INFO(port, size, in, 1, rep), n)) {
+            return 1;
+        }
+        if (in) {
+            for (uint64_t i = 0; i < n * size; i++) {
+                ((uint8_t *)r->rdi)[i % size] = g->shared_buffer[i];
+                if (i % size == size - 1) {
+                    r->rdi += step;
+                }
+            }
+        }
+        count -= n;
+        if (rep) {
+            r->rcx -= n;
+        }
+    }
+    return 0;
+}
+
 void vc_handler_c(struct vc_regs *r)
 {
     struct ghcb *g = &ghcb_page;
     const uint8_t *p = (const uint8_t *)r->rip;
     unsigned prefixes = 0;
-    int opsize16 = 0;
+    int opsize16 = 0, rep = 0;
 
     vc_counts[vc_class(r->error_code)]++;
     while (*p == 0x66 || *p == 0xf3 || *p == 0xf2 || (*p & 0xf0) == 0x40) {
         if (*p == 0x66) {
             opsize16 = 1;
+        }
+        if (*p == 0xf3 || *p == 0xf2) {
+            rep = 1;
         }
         p++;
         prefixes++;
@@ -308,6 +362,12 @@ void vc_handler_c(struct vc_regs *r)
             len++;
         } else if (op >= 0xec && op <= 0xef) {
             port = (uint16_t)r->rdx;
+        } else if (op >= 0x6c && op <= 0x6f) {
+            if (vc_string_io(r, op, rep, opsize16)) {
+                goto unexpected;
+            }
+            r->rip += len;
+            return;
         } else {
             goto unexpected;
         }
@@ -532,6 +592,117 @@ static void test_ap_creation(void)
         asm volatile("pause");
     }
     CHECK(ap_started, "AP started from the VMSA and ran its entry");
+}
+
+#define MSR_EFER            0xc0000080
+#define EFER_SVME           (1 << 12)
+#define FW_CFG_PORT_SEL     0x510
+#define FW_CFG_PORT_DATA    0x511
+#define FW_CFG_SIGNATURE    0x0000
+#define FW_CFG_ID           0x0001
+
+/* the GHCB protocol version field is not checked (KVM does not either) */
+static void test_ghcb_version0(void)
+{
+    struct ghcb *g = &ghcb_page;
+
+    ghcb_clear(g);
+    g->protocol_version = 0;
+    ghcb_call(g, SVM_VMGEXIT_HV_FEATURES, 0, 0);
+    CHECK(g->sw_exit_info_1 == 0, "NAE event with GHCB protocol version 0 (%" PRIx64 ")",
+          g->sw_exit_info_1);
+}
+
+/* EFER.SVME clear: VMGEXIT (F3 and F2 forms) and VMMCALL still reach the hypervisor */
+static void test_vmgexit_no_svme(void)
+{
+    uint64_t efer = rdmsr(MSR_EFER), resp, resp2;
+    unsigned before = vc_counts[10];
+
+    wrmsr(MSR_EFER, efer & ~EFER_SVME);
+    resp = ghcb_msr_protocol(GHCB_MSR_INFO_REQ);
+    wrmsr(MSR_GHCB, GHCB_MSR_HV_FT_REQ);
+    asm volatile(".byte 0xf2, 0x0f, 0x01, 0xd9" : : : "memory");
+    resp2 = rdmsr(MSR_GHCB);
+    asm volatile("vmmcall" : : "a"(0));
+    CHECK(!(rdmsr(MSR_EFER) & EFER_SVME) && (resp & 0xfff) == GHCB_MSR_INFO_RESP &&
+          (resp2 & 0xfff) == GHCB_MSR_HV_FT_RESP && vc_counts[10] == before + 1,
+          "VMGEXIT (F3, F2) and VMMCALL with EFER.SVME clear (%" PRIx64 " %" PRIx64 ")",
+          resp, resp2);
+    wrmsr(MSR_EFER, efer);
+}
+
+static void fw_cfg_select(uint16_t key)
+{
+    asm volatile("outw %0, %1" : : "a"(key), "Nd"((uint16_t)FW_CFG_PORT_SEL));
+}
+
+/* INS and OUTS through #VC and the string IOIO event, on the fw_cfg ports */
+static void test_string_io(void)
+{
+    struct ghcb *g = &ghcb_page;
+    static const uint16_t keys[2] = { FW_CFG_ID, FW_CFG_SIGNATURE };
+    static uint8_t buf[8], outside[64] __attribute__((aligned(64)));
+    static uint8_t b1;
+    const void *src = keys;
+    void *dst = buf;
+    uint64_t n = 2;
+    unsigned before = vc_counts[3];
+
+    /* REP OUTSW of two selectors: the last one written is in effect */
+    asm volatile("rep outsw" : "+S"(src), "+c"(n) : "d"(FW_CFG_PORT_SEL) : "memory");
+    CHECK(n == 0 && src == keys + 2 && vc_counts[3] == before + 1,
+          "REP OUTSW: one #VC for 2 elements, RSI and RCX advanced");
+    n = 4;
+    asm volatile("rep insb" : "+D"(dst), "+c"(n) : "d"(FW_CFG_PORT_DATA) : "memory");
+    CHECK(n == 0 && dst == buf + 4 && buf[0] == 'Q' && buf[1] == 'E' &&
+          buf[2] == 'M' && buf[3] == 'U',
+          "REP INSB of 4 bytes reads the fw_cfg signature in order");
+
+    /* DF set: the elements land at descending addresses */
+    fw_cfg_select(FW_CFG_SIGNATURE);
+    dst = buf + 7;
+    n = 4;
+    asm volatile("std\n\trep insb\n\tcld"
+                 : "+D"(dst), "+c"(n) : "d"(FW_CFG_PORT_DATA) : "memory");
+    CHECK(n == 0 && dst == buf + 3 && buf[7] == 'Q' && buf[6] == 'E' &&
+          buf[5] == 'M' && buf[4] == 'U',
+          "REP INSB with DF set stores downwards");
+
+    /* INSB without REP: one element, RCX untouched */
+    fw_cfg_select(FW_CFG_SIGNATURE);
+    dst = &b1;
+    n = 5;
+    asm volatile("insb" : "+D"(dst), "+c"(n) : "d"(FW_CFG_PORT_DATA) : "memory");
+    CHECK(b1 == 'Q' && dst == &b1 + 1 && n == 5,
+          "INSB without REP reads one byte (%x)", b1);
+
+    /* the hypervisor side: count 0, a scratch area outside the GHCB, bad scratch areas */
+    ghcb_clear(g);
+    GHCB_SET(g, sw_scratch, (uint64_t)g->shared_buffer);
+    ghcb_call(g, SVM_EXIT_IOIO, IOIO_INFO(FW_CFG_PORT_DATA, 1, 1, 1, 1), 0);
+    CHECK(g->sw_exit_info_1 == 0, "string IOIO of 0 elements succeeds");
+    fw_cfg_select(FW_CFG_SIGNATURE);
+    ghcb_clear(g);
+    GHCB_SET(g, sw_scratch, (uint64_t)outside);
+    ghcb_call(g, SVM_EXIT_IOIO, IOIO_INFO(FW_CFG_PORT_DATA, 1, 1, 1, 1), 4);
+    CHECK(g->sw_exit_info_1 == 0 && outside[0] == 'Q' && outside[3] == 'U',
+          "string IOIO with a scratch area outside the GHCB");
+    ghcb_clear(g);
+    GHCB_SET(g, sw_scratch, (uint64_t)g->shared_buffer + 8);
+    ghcb_call(g, SVM_EXIT_IOIO, IOIO_INFO(FW_CFG_PORT_DATA, 1, 1, 1, 1),
+              sizeof(g->shared_buffer));
+    CHECK(g->sw_exit_info_1 == 2 && g->sw_exit_info_2 == 4,
+          "string IOIO past the end of the shared buffer is refused");
+    ghcb_clear(g);
+    GHCB_SET(g, sw_scratch, (uint64_t)outside);
+    ghcb_call(g, SVM_EXIT_IOIO, IOIO_INFO(FW_CFG_PORT_DATA, 4, 1, 1, 1), 16 * 1024 + 1);
+    CHECK(g->sw_exit_info_1 == 2 && g->sw_exit_info_2 == 4,
+          "string IOIO over 64 KiB outside the GHCB is refused");
+    ghcb_clear(g);
+    ghcb_call(g, SVM_EXIT_IOIO, IOIO_INFO(FW_CFG_PORT_DATA, 1, 1, 1, 1), 1);
+    CHECK(g->sw_exit_info_1 == 2 && g->sw_exit_info_2 == 2,
+          "string IOIO without a scratch area is missing input");
 }
 
 #if defined(SEV_SNP_TEST)
@@ -910,6 +1081,10 @@ int main(void)
         ghcb_call(g, SVM_VMGEXIT_MMIO_READ, (uint64_t)&mmio_buf, 4);
         CHECK(g->sw_exit_info_1 == 2 && g->sw_exit_info_2 == 4, "scratch inside the GHCB header is refused");
     }
+
+    test_string_io();
+    test_ghcb_version0();
+    test_vmgexit_no_svme();
 
     /* HV_FEATURES NAE */
     ghcb_clear(g);
