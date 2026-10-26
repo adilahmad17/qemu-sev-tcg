@@ -34,6 +34,12 @@ memory: CFLAGS+=-DCHECK_UNALIGNED=1
 # Running
 QEMU_OPTS+=-device isa-debugcon,chardev=output -device isa-debug-exit,iobase=0xf4,iosize=0x4 -kernel
 
+# XSAVEC needs a CPU model that has it; keep the compiler off the vector
+# registers between the loads and the saves of the test
+xsavec: CFLAGS+=-mgeneral-regs-only
+run-xsavec: QEMU_OPTS:=-cpu max $(QEMU_OPTS)
+run-plugin-xsavec-with-%: QEMU_OPTS:=-cpu max $(QEMU_OPTS)
+
 # The emulated SEV-ES guest tests boot from an IGVM file (mkigvm.py wraps
 # the test ELF) as an sev-emu guest with the SEV-ES policy; they need a
 # QEMU built with IGVM support. The test binary that the generic rule appends
