@@ -112,7 +112,10 @@ fi
 log "configuring QEMU"
 mkdir -p "$BUILD"
 cd "$BUILD"
-PKG_CONFIG_PATH=$PREFIX/lib64/pkgconfig ../configure --prefix="$PREFIX" \
+# a shallow checkout (a git submodule) has no tags for `git describe`: name the revision explicitly
+PKGVERSION=
+if rev=$(git -C "$HERE" rev-parse --short=10 HEAD 2>/dev/null); then PKGVERSION="--with-pkgversion=g$rev"; fi
+PKG_CONFIG_PATH=$PREFIX/lib64/pkgconfig ../configure --prefix="$PREFIX" $PKGVERSION \
     --target-list=x86_64-softmmu --enable-kvm --enable-igvm --enable-slirp \
     --disable-docs --disable-werror --disable-xen --disable-gtk --disable-sdl --disable-vnc \
     --disable-opengl --disable-virglrenderer
