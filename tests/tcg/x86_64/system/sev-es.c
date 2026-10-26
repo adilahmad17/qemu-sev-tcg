@@ -653,11 +653,17 @@ int main(void)
           "access to an unvalidated page: #VC 0x404, CR2 %" PRIx64 ", retried", vc_last_cr2);
     rc = pvalidate(snp_pages, 0, 1, &nc);
     CHECK(rc == 0 && nc == 1, "the handler's validation counts: no change now");
-    /* a page outside the mapping and a bad size */
+    /* the APM: bits 11:0 of the address and ECX bits 31:1 are ignored */
     rc = pvalidate(snp_pages + 7, 0, 1, &nc);
-    CHECK(rc == 1, "PVALIDATE of an unaligned address fails (rc %d)", rc);
+    CHECK(rc == 0 && nc == 1,
+          "PVALIDATE of an unaligned address: its page (rc %d cf %d)", rc, nc);
     rc = pvalidate(snp_pages, 2, 1, &nc);
-    CHECK(rc == 1, "PVALIDATE with an invalid size fails (rc %d)", rc);
+    CHECK(rc == 0 && nc == 1, "PVALIDATE uses ECX bit 0 only (rc %d cf %d)", rc, nc);
+    if ((uint64_t)snp_pages & 0x1fffff) {
+        rc = pvalidate(snp_pages, 1, 1, &nc);
+        CHECK(rc == 1,
+              "PVALIDATE of a 2M page that is not 2M aligned fails (rc %d)", rc);
+    }
 
     /* page-state changes: shared pages cannot be validated */
     resp = psc_msr(snp_pages + 4096, 2);
@@ -680,8 +686,18 @@ int main(void)
     CHECK(rc == 0, "RMPADJUST VMSA attribute for VMPL1 (rc %d)", rc);
     rc = rmpadjust(snp_pages + 2 * 4096, 0, 0 | (1 << 16));
     CHECK(rc == 2, "RMPADJUST for VMPL0 fails with permission (rc %d)", rc);
-    rc = rmpadjust(snp_pages + 2 * 4096 + 8, 0, 1);
-    CHECK(rc == 1, "RMPADJUST of an unaligned address fails (rc %d)", rc);
+    /* bits 11:0 are ignored (OVMF's VMPL0 probe passes such an address) */
+    rc = rmpadjust(snp_pages + 2 * 4096 + 0x194, 0, 1);
+    CHECK(rc == 0, "RMPADJUST of an unaligned address adjusts its page (rc %d)", rc);
+    if ((uint64_t)snp_pages & 0x1fffff) {
+        rc = rmpadjust(snp_pages, 1, 1);
+        CHECK(rc == 1,
+              "RMPADJUST of a 2M page that is not 2M aligned fails (rc %d)", rc);
+    }
+    /* the VMPL check comes before the translation: no page fault */
+    rc = rmpadjust((void *)0x7fffff000000ULL, 0, 0);
+    CHECK(rc == 2,
+          "RMPADJUST for VMPL0 of an unmapped page fails with permission (rc %d)", rc);
 
     /* a guest request has no firmware behind it */
     ghcb_clear(g);

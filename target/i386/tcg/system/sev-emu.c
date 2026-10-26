@@ -203,13 +203,18 @@ static void sev_emu_nae_psc(CPUX86State *env, hwaddr ghcb_gpa, GhcbPage *ghcb)
     ghcb_result(ghcb, GHCB_RESULT_OK, (uint64_t)error << 32);
 }
 
-/* PVALIDATE and RMPADJUST operands: the page of a virtual address */
+/*
+ * PVALIDATE and RMPADJUST operands: the page of a virtual address. As in the
+ * APM pseudo-code, bits 11:0 of the address are ignored and a 2M page must
+ * be 2M aligned (false: FAIL_INPUT).
+ */
 static bool sev_snp_emu_page_of(CPUX86State *env, target_ulong va,
                                 target_ulong size, hwaddr *gpa,
                                 uintptr_t retaddr)
 {
     hwaddr paddr;
 
+    va &= ~(target_ulong)0xfff;
     if (va & (size - 1)) {
         return false;
     }
@@ -228,20 +233,19 @@ static bool sev_snp_emu_page_of(CPUX86State *env, target_ulong va,
 #define RMPADJUST_FAIL_PERMISSION   2
 
 /*
- * PVALIDATE: RAX the page's virtual address, ECX the size (0 4K, 1 2M), EDX
+ * PVALIDATE: RAX the page's virtual address, ECX[0] the size (0 4K, 1 2M), EDX
  * bit 0 validate or rescind. Returns EAX in the low 32 bits and CF ("the
  * page already was in that state") in bit 32.
  */
 uint64_t helper_sev_pvalidate(CPUX86State *env, target_ulong rax,
                               target_ulong rcx, target_ulong rdx)
 {
-    bool huge = (uint32_t)rcx == 1, validate = rdx & 1;
+    bool huge = rcx & 1, validate = rdx & 1;
     target_ulong size = huge ? 2 * MiB : 4096;
     hwaddr gpa;
     bool no_change = true;
 
-    if ((uint32_t)rcx > 1 ||
-        !sev_snp_emu_page_of(env, rax, size, &gpa, GETPC())) {
+    if (!sev_snp_emu_page_of(env, rax, size, &gpa, GETPC())) {
         return PVALIDATE_FAIL_INPUT;
     }
     if (huge && sev_snp_emu_page_state(gpa + size - 4096) == SNP_PAGE_NONE) {
@@ -270,25 +274,28 @@ uint64_t helper_sev_pvalidate(CPUX86State *env, target_ulong rax,
 }
 
 /*
- * RMPADJUST: RAX the page's virtual address, ECX the size, RDX the target
+ * RMPADJUST: RAX the page's virtual address, RCX[0] the size, RDX the target
  * VMPL (bits 7:0), its permissions (15:8) and the VMSA attribute (16). No
  * VMPL model here: the VMSA attribute is recorded, permissions are accepted.
  */
 target_ulong helper_sev_rmpadjust(CPUX86State *env, target_ulong rax,
                                   target_ulong rcx, target_ulong rdx)
 {
-    bool huge = (uint32_t)rcx == 1;
+    bool huge = rcx & 1;
     target_ulong size = huge ? 2 * MiB : 4096;
     unsigned vmpl = rdx & 0xff;
     hwaddr gpa;
 
-    if ((uint32_t)rcx > 1 ||
-        !sev_snp_emu_page_of(env, rax, size, &gpa, GETPC())) {
+    /* the order of the checks is the APM's */
+    if (huge && (rax & (size - 1) & ~0xfffULL)) {
         return RMPADJUST_FAIL_INPUT;
     }
     if (vmpl == 0 || vmpl > 3) {
         /* only a lower VMPL can be adjusted, the guest runs at VMPL0 */
         return RMPADJUST_FAIL_PERMISSION;
+    }
+    if (!sev_snp_emu_page_of(env, rax, size, &gpa, GETPC())) {
+        return RMPADJUST_FAIL_INPUT;
     }
     for (hwaddr p = gpa; p < gpa + size; p += 4096) {
         uint8_t state = sev_snp_emu_page_state(p);
