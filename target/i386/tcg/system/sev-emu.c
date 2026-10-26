@@ -329,7 +329,7 @@ static void sev_emu_msr_protocol(CPUX86State *env, int next_eip_addend)
         uint32_t reg = (req >> 30) & 3;
         uint32_t eax, ebx, ecx, edx, value;
 
-        cpu_x86_cpuid(env, fn, 0, &eax, &ebx, &ecx, &edx);
+        sev_emu_cpuid(env, fn, 0, &eax, &ebx, &ecx, &edx);
         value = reg == 0 ? eax : reg == 1 ? ebx : reg == 2 ? ecx : edx;
         resp = GHCB_MSR_CPUID_RESP | ((uint64_t)reg << 30) |
                ((uint64_t)value << 32);
@@ -733,7 +733,7 @@ static void sev_emu_vmgexit_ghcb(CPUX86State *env, hwaddr gpa,
             /* leaf 0xD describes the XSAVE area of the XCR0 the guest passes */
             env->xcr0 = ghcb->xcr0;
         }
-        cpu_x86_cpuid(env, ghcb->rax, ghcb->rcx, &eax, &ebx, &ecx, &edx);
+        sev_emu_cpuid(env, ghcb->rax, ghcb->rcx, &eax, &ebx, &ecx, &edx);
         env->xcr0 = saved_xcr0;
         GHCB_SET(ghcb, rax, eax);
         GHCB_SET(ghcb, rbx, ebx);

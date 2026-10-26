@@ -814,7 +814,8 @@ int main(void)
     fn = cpuid_page_find(0xd, 0);
     CHECK(fn && fn->ebx == 0x240 && fn->xcr0_in == 1, "CPUID page: leaf 0xd.0 convention");
     fn = cpuid_page_find(1, 0);
-    CHECK(fn && (fn->ecx & (1 << 21)), "CPUID page: leaf 1 has x2APIC");
+    CHECK(fn && (fn->ecx & (1 << 21)) && !(fn->ecx & (1 << 3)),
+          "CPUID page: leaf 1 has x2APIC, not MONITOR");
     CHECK(cpuid_page_find(0x80000000, 0) && cpuid_page_find(7, 0),
           "CPUID page: leaves 0x80000000 and 7");
 
@@ -1005,6 +1006,11 @@ int main(void)
     CHECK(vc_counts[1] == before + 1, "CPUID raised #VC");
     CHECK((a & 0xa) == 0xa && (b & 0x3f) == 51,
           "CPUID 0x8000001f: SEV, SEV-ES, C-bit 51 (eax %x ebx %x)", a, b);
+    /* MONITOR/MWAIT raise #VC, so the hypervisor does not advertise them */
+    cpuid(1, 0, &a, &b, &c, &d);
+    resp = ghcb_msr_protocol(GHCB_MSR_CPUID_REQ | (1ULL << 32) | (2ULL << 30));
+    CHECK(!(c & (1 << 3)) && !((resp >> 32) & (1 << 3)) && (resp >> 32) == c,
+          "CPUID 1 without MONITOR, #VC and MSR protocol (ecx %x)", c);
 
     /* the MSR protocol */
     resp = ghcb_msr_protocol(GHCB_MSR_INFO_REQ);

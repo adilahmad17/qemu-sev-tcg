@@ -841,7 +841,7 @@ static int sev_snp_emu_set_cpuid(hwaddr gpa, uint8_t *hva, size_t len,
         bool ok = n < SNP_CPUID_FUNCTION_MAXCOUNT; \
         if (ok) { \
             SnpCpuidFunc *fn = &info->entries[n]; \
-            cpu_x86_cpuid(env, (l), (c), &eax, &ebx, &ecx, &edx); \
+            sev_emu_cpuid(env, (l), (c), &eax, &ebx, &ecx, &edx); \
             fn->eax_in = (l); \
             fn->ecx_in = (c); \
             fn->eax = eax; \
@@ -983,6 +983,25 @@ uint64_t sev_emu_sev_status(void)
         status |= 4;
     }
     return status;
+}
+
+/*
+ * CPUID as the emulated hypervisor answers it for an SEV-ES or SEV-SNP
+ * guest (the #VC CPUID event, the MSR protocol, the SNP CPUID page).
+ * MONITOR and MWAIT always raise #VC here, so they are not advertised, as
+ * KVM does not advertise them when it intercepts them (leaf 1 without
+ * MONITOR, leaf 5 zero). A guest that believes them usable parks its
+ * vCPUs in MWAIT where it cannot take the #VC (OVMF's AP loop).
+ */
+void sev_emu_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
+                   uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx)
+{
+    cpu_x86_cpuid(env, index, count, eax, ebx, ecx, edx);
+    if (index == 1) {
+        *ecx &= ~CPUID_EXT_MONITOR;
+    } else if (index == 5) {
+        *eax = *ebx = *ecx = *edx = 0;
+    }
 }
 
 /* GHCB hypervisor features (HV_FEATURES): what the SNP emulation offers */

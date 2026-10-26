@@ -79,6 +79,8 @@ static inline void sev_snp_emu_page_set(hwaddr gpa, uint8_t state)
 }
 uint64_t sev_emu_sev_status(void);
 uint64_t sev_emu_hv_features(void);
+void sev_emu_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
+                   uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx);
 int sev_emu_ap_creation(uint32_t request, uint32_t apic_id, hwaddr vmsa_gpa,
                         uint64_t sev_features);
 bool sev_emu_ap_init(CPUState *cpu);
