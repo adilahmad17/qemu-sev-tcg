@@ -902,7 +902,9 @@ void helper_sev_vmgexit(CPUX86State *env, int next_eip_addend)
     }
     if (msr == 0) {
         /* no GHCB: the guest misuses VMGEXIT, nothing to answer */
-        qemu_log_mask(LOG_GUEST_ERROR, "sev-emu: VMGEXIT without a GHCB\n");
+        qemu_log_mask(LOG_GUEST_ERROR, "sev-emu: VMGEXIT without a GHCB "
+                      "(vCPU %d, RIP 0x" TARGET_FMT_lx ")\n",
+                      env_cpu(env)->cpu_index, env->eip);
         return;
     }
     sev_emu_vmgexit_ghcb(env, msr, next_eip_addend);
