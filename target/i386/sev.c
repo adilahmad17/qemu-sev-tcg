@@ -3658,39 +3658,63 @@ static int sev_emu_launch_update_data(SevCommonState *sev_common,
 /*
  * sev-snp-emu started with -bios: the pages the OVMF metadata describes, as
  * snp_populate_metadata_pages() launches them for sev-snp-guest (an IGVM
- * file lists these pages itself).
+ * file lists these pages itself): the CPUID and secrets pages, the kernel
+ * hashes, and the memory the firmware expects zeroed and validated.
  */
 static void sev_snp_emu_launch_metadata(SevSnpEmuState *sev_snp_emu)
 {
     OvmfSevMetadata *metadata = pc_system_get_ovmf_sev_metadata_ptr();
+    Error *local_err = NULL;
 
     if (!metadata) {
-        return;
+        error_report("sev-snp-emu: the firmware has no SEV metadata (an "
+                     "OVMF with SEV-SNP support, or an IGVM file, is needed)");
+        exit(1);
     }
     for (int i = 0; i < metadata->num_desc; i++) {
         OvmfSevMetadataDesc *desc = &metadata->descs[i];
         g_autoptr(MemoryRegion) mr = NULL;
         uint8_t *hva;
+        int ret = 0;
 
-        if (desc->type != SEV_DESC_TYPE_SNP_KERNEL_HASHES) {
-            continue;
-        }
         hva = gpa2hva(&mr, desc->base, desc->len, NULL);
         if (!hva) {
             error_report("%s: no guest memory at 0x%x (0x%x bytes)",
                          __func__, desc->base, desc->len);
             exit(1);
         }
-        memset(hva, 0, desc->len);
-        if (sev_snp_emu->kernel_hashes_data) {
-            assert(sev_snp_emu->kernel_hashes_offset +
-                   sizeof(*sev_snp_emu->kernel_hashes_data) <= desc->len);
-            memcpy(hva + sev_snp_emu->kernel_hashes_offset,
-                   sev_snp_emu->kernel_hashes_data,
-                   sizeof(*sev_snp_emu->kernel_hashes_data));
+        switch (desc->type) {
+        case SEV_DESC_TYPE_CPUID:
+            ret = sev_snp_emu_set_cpuid(desc->base, hva, desc->len,
+                                        &local_err);
+            break;
+        case SEV_DESC_TYPE_SNP_SECRETS:
+            ret = sev_snp_emu_set_secrets(desc->base, hva, desc->len,
+                                          &local_err);
+            break;
+        case SEV_DESC_TYPE_SNP_KERNEL_HASHES:
+            memset(hva, 0, desc->len);
+            if (sev_snp_emu->kernel_hashes_data) {
+                assert(sev_snp_emu->kernel_hashes_offset +
+                       sizeof(*sev_snp_emu->kernel_hashes_data) <= desc->len);
+                memcpy(hva + sev_snp_emu->kernel_hashes_offset,
+                       sev_snp_emu->kernel_hashes_data,
+                       sizeof(*sev_snp_emu->kernel_hashes_data));
+            }
+            sev_snp_emu_pages_set(desc->base, desc->len,
+                                  SNP_PAGE_PRIVATE | SNP_PAGE_VALIDATED);
+            break;
+        default:
+            /* SNP_SEC_MEM and unknown types: zero pages, as KVM adds them */
+            memset(hva, 0, desc->len);
+            sev_snp_emu_pages_set(desc->base, desc->len,
+                                  SNP_PAGE_PRIVATE | SNP_PAGE_VALIDATED);
+            break;
         }
-        sev_snp_emu_pages_set(desc->base, desc->len,
-                              SNP_PAGE_PRIVATE | SNP_PAGE_VALIDATED);
+        if (ret < 0) {
+            error_report_err(local_err);
+            exit(1);
+        }
     }
 }
 
