@@ -2171,6 +2171,33 @@ ExtSaveArea x86_ext_save_areas[XSAVE_STATE_AREA_COUNT] = {
     },
 };
 
+/*
+ * In the compacted form of an XSAVE area, the extended state components
+ * of @mask follow the legacy region and the header in the order of their
+ * bits, each one starting at a 64-byte boundary if CPUID.(EAX=0DH,ECX=i):ECX[1]
+ * is set.  Return the offset of component @bit (2 or more) in such an area.
+ */
+uint32_t xsave_area_compacted_offset(uint64_t mask, int bit)
+{
+    uint32_t offset = x86_ext_save_areas[0].size;
+    const ExtSaveArea *esa;
+    int i;
+
+    for (i = 2; i <= bit; i++) {
+        esa = &x86_ext_save_areas[i];
+        if (i < bit && !((mask >> i) & 1)) {
+            continue;
+        }
+        if (esa->ecx & ESA_FEATURE_ALIGN64_MASK) {
+            offset = QEMU_ALIGN_UP(offset, 64);
+        }
+        if (i < bit) {
+            offset += esa->size;
+        }
+    }
+    return offset;
+}
+
 uint32_t xsave_area_size(uint64_t mask, bool compacted)
 {
     uint64_t ret = x86_ext_save_areas[0].size;
@@ -2181,7 +2208,14 @@ uint32_t xsave_area_size(uint64_t mask, bool compacted)
     for (i = 2; i < ARRAY_SIZE(x86_ext_save_areas); i++) {
         esa = &x86_ext_save_areas[i];
         if ((mask >> i) & 1) {
-            offset = compacted ? ret : esa->offset;
+            if (compacted) {
+                offset = ret;
+                if (esa->ecx & ESA_FEATURE_ALIGN64_MASK) {
+                    offset = QEMU_ALIGN_UP(offset, 64);
+                }
+            } else {
+                offset = esa->offset;
+            }
             ret = MAX(ret, offset + esa->size);
         }
     }

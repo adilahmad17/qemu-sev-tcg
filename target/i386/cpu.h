@@ -3037,6 +3037,7 @@ bool cpu_is_bsp(X86CPU *cpu);
 void x86_cpu_xrstor_all_areas(X86CPU *cpu, const void *buf, uint32_t buflen);
 void x86_cpu_xsave_all_areas(X86CPU *cpu, void *buf, uint32_t buflen);
 uint32_t xsave_area_size(uint64_t mask, bool compacted);
+uint32_t xsave_area_compacted_offset(uint64_t mask, int bit);
 void x86_update_hflags(CPUX86State* env);
 int decompact_xsave_area(const void *buf, size_t buflen, CPUX86State *env);
 int compact_xsave_area(CPUX86State *env, void *buf, size_t buflen);
