@@ -655,6 +655,9 @@ typedef enum X86Seg {
 
 #define XSTATE_DYNAMIC_MASK             (XSTATE_XTILE_DATA_MASK)
 
+/* XCOMP_BV bit 63: the XSAVE area is in the compacted form */
+#define XSTATE_XCOMP_BV_COMPACTED       (1ULL << 63)
+
 #define ESA_FEATURE_ALIGN64_BIT         1
 #define ESA_FEATURE_XFD_BIT             2
 

@@ -4826,6 +4826,14 @@ static void gen_XSAVE(DisasContext *s, X86DecodedInsn *decode)
     gen_helper_xsave(tcg_env, s->A0, features);
 }
 
+static void gen_XSAVEC(DisasContext *s, X86DecodedInsn *decode)
+{
+    TCGv_i64 features = tcg_temp_new_i64();
+
+    tcg_gen_concat_tl_i64(features, cpu_regs[R_EAX], cpu_regs[R_EDX]);
+    gen_helper_xsavec(tcg_env, s->A0, features);
+}
+
 static void gen_XSAVEOPT(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv_i64 features = tcg_temp_new_i64();

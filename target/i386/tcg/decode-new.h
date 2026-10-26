@@ -133,6 +133,7 @@ typedef enum X86CPUIDFeature {
     X86_FEAT_SSE4A,
     X86_FEAT_XSAVE,
     X86_FEAT_XSAVEOPT,
+    X86_FEAT_XSAVEC,
 } X86CPUIDFeature;
 
 /* Execution flags */

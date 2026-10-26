@@ -156,6 +156,7 @@
  *                                  MONITOR, MWAIT, CLAC, STAC, XGETBV, XSETBV,
  *                                  SWAPGS, RDTSCP)
  * 0x0F 0xC7 (reg operand) group 9 (RDRAND, RDSEED, RDPID)
+ * 0x0F 0xC7 (mem operand) group 9 (XSAVEC)
  *
  * MPX:
  * 0x0F 0x1A               BNDLDX, BNDMOV, BNDCL, BNDCU
@@ -451,6 +452,8 @@ static void decode_group9(DisasContext *s, CPUX86State *env, X86OpEntry *entry, 
         X86_OP_ENTRY1(CMPXCHG8B,  M,q,  lock p_00 cpuid(CX8));
     static const X86OpEntry cmpxchg16b =
         X86_OP_ENTRY1(CMPXCHG16B, M,dq, lock p_00 cpuid(CX16));
+    static const X86OpEntry xsavec =
+        X86_OP_ENTRYw(XSAVEC,     M,y,  cpuid(XSAVEC) p_00);
 
     int modrm = get_modrm(s, env);
     int op = (modrm >> 3) & 7;
@@ -459,6 +462,8 @@ static void decode_group9(DisasContext *s, CPUX86State *env, X86OpEntry *entry, 
         *entry = group9_reg;
     } else if (op == 1) {
         *entry = REX_W(s) ? cmpxchg16b : cmpxchg8b;
+    } else if (op == 4) {
+        *entry = xsavec;
     } else {
         *entry = UNKNOWN_OPCODE;
     }
@@ -2599,6 +2604,8 @@ static bool has_cpuid_feature(DisasContext *s, X86CPUIDFeature cpuid)
 
     case X86_FEAT_XSAVEOPT:
         return (s->cpuid_xsave_features & CPUID_XSAVE_XSAVEOPT);
+    case X86_FEAT_XSAVEC:
+        return s->cpuid_xsave_features & CPUID_XSAVE_XSAVEC;
     }
     g_assert_not_reached();
 }

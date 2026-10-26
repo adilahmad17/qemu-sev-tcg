@@ -2704,6 +2704,46 @@ static void do_xsave_pkru(X86Access *ac, target_ulong ptr)
     access_stq(ac, ptr, ac->env->pkru);
 }
 
+/*
+ * Offset of the extended state component @bit in an XSAVE area: fixed in
+ * the standard form, and in the compacted form (XCOMP_BV bit 63 set) given
+ * by the components that XCOMP_BV says the area holds.
+ */
+static unsigned xsave_offset(uint64_t xcomp_bv, int bit)
+{
+    if (xcomp_bv & XSTATE_XCOMP_BV_COMPACTED) {
+        return xsave_area_compacted_offset(xcomp_bv, bit);
+    }
+    switch (bit) {
+    case XSTATE_YMM_BIT:
+        return XO(avx_state);
+    case XSTATE_BNDREGS_BIT:
+        return XO(bndreg_state);
+    case XSTATE_BNDCSR_BIT:
+        return XO(bndcsr_state);
+    case XSTATE_PKRU_BIT:
+        return XO(pkru_state);
+    default:
+        g_assert_not_reached();
+    }
+}
+
+/* The size of an XSAVE area up to the end of the components of @mask. */
+static unsigned xsave_size(uint64_t xcomp_bv, uint64_t mask)
+{
+    int bit;
+
+    if (!(xcomp_bv & XSTATE_XCOMP_BV_COMPACTED)) {
+        return xsave_area_size(mask, false);
+    }
+    mask &= ~(XSTATE_FP_MASK | XSTATE_SSE_MASK);
+    if (!mask) {
+        return sizeof(X86LegacyXSaveArea) + sizeof(X86XSaveHeader);
+    }
+    bit = 63 - clz64(mask);
+    return xsave_offset(xcomp_bv, bit) + x86_ext_save_areas[bit].size;
+}
+
 static void do_fxsave(X86Access *ac, target_ulong ptr)
 {
     CPUX86State *env = ac->env;
@@ -2749,32 +2789,50 @@ static uint64_t get_xinuse(CPUX86State *env)
     return inuse;
 }
 
+/*
+ * Save the components of @opt, a subset of @rfbm.  @xcomp_bv is zero for
+ * the standard form, or the XCOMP_BV of the compacted form (XSAVEC).
+ */
 static void do_xsave_access(X86Access *ac, target_ulong ptr, uint64_t rfbm,
-                            uint64_t inuse, uint64_t opt)
+                            uint64_t inuse, uint64_t opt, uint64_t xcomp_bv)
 {
     uint64_t old_bv, new_bv;
 
     if (opt & XSTATE_FP_MASK) {
         do_xsave_fpu(ac, ptr);
     }
-    if (rfbm & XSTATE_SSE_MASK) {
-        /* Note that saving MXCSR is not suppressed by XSAVEOPT.  */
+    /*
+     * Saving MXCSR is not suppressed by XSAVEOPT.  The compacted form saves
+     * it as part of the SSE state only.
+     */
+    if (xcomp_bv ? opt & XSTATE_SSE_MASK : rfbm & XSTATE_SSE_MASK) {
         do_xsave_mxcsr(ac, ptr);
     }
     if (opt & XSTATE_SSE_MASK) {
         do_xsave_sse(ac, ptr);
     }
     if (opt & XSTATE_YMM_MASK) {
-        do_xsave_ymmh(ac, ptr + XO(avx_state));
+        do_xsave_ymmh(ac, ptr + xsave_offset(xcomp_bv, XSTATE_YMM_BIT));
     }
     if (opt & XSTATE_BNDREGS_MASK) {
-        do_xsave_bndregs(ac, ptr + XO(bndreg_state));
+        do_xsave_bndregs(ac, ptr + xsave_offset(xcomp_bv,
+                                                XSTATE_BNDREGS_BIT));
     }
     if (opt & XSTATE_BNDCSR_MASK) {
-        do_xsave_bndcsr(ac, ptr + XO(bndcsr_state));
+        do_xsave_bndcsr(ac, ptr + xsave_offset(xcomp_bv, XSTATE_BNDCSR_BIT));
     }
     if (opt & XSTATE_PKRU_MASK) {
-        do_xsave_pkru(ac, ptr + XO(pkru_state));
+        do_xsave_pkru(ac, ptr + xsave_offset(xcomp_bv, XSTATE_PKRU_BIT));
+    }
+
+    if (xcomp_bv) {
+        /*
+         * The compacted form writes all of XSTATE_BV, and XCOMP_BV;
+         * the rest of the header is left alone.
+         */
+        access_stq(ac, ptr + XO(header.xstate_bv), inuse & rfbm);
+        access_stq(ac, ptr + XO(header.xcomp_bv), xcomp_bv);
+        return;
     }
 
     /* Update the XSTATE_BV field.  */
@@ -2810,7 +2868,7 @@ static void do_xsave(CPUX86State *env, target_ulong ptr, uint64_t rfbm,
     size = xsave_area_size(opt, false);
 
     access_prepare(&ac, env, ptr, size, MMU_DATA_STORE, ra);
-    do_xsave_access(&ac, ptr, rfbm, inuse, opt);
+    do_xsave_access(&ac, ptr, rfbm, inuse, opt, 0);
 }
 
 void helper_xsave(CPUX86State *env, target_ulong ptr, uint64_t rfbm)
@@ -2822,6 +2880,26 @@ void helper_xsaveopt(CPUX86State *env, target_ulong ptr, uint64_t rfbm)
 {
     uint64_t inuse = get_xinuse(env);
     do_xsave(env, ptr, rfbm, inuse, inuse, GETPC());
+}
+
+/*
+ * XSAVEC saves the components of RFBM in the compacted form, leaving out
+ * the ones in their initial configuration (XINUSE clear) as XSAVEOPT does.
+ */
+void helper_xsavec(CPUX86State *env, target_ulong ptr, uint64_t rfbm)
+{
+    uintptr_t ra = GETPC();
+    uint64_t inuse = get_xinuse(env);
+    uint64_t xcomp_bv;
+    X86Access ac;
+
+    do_xsave_chk(env, ptr, ra);
+
+    rfbm &= env->xcr0;
+    xcomp_bv = XSTATE_XCOMP_BV_COMPACTED | rfbm;
+    access_prepare(&ac, env, ptr, xsave_size(xcomp_bv, rfbm & inuse),
+                   MMU_DATA_STORE, ra);
+    do_xsave_access(&ac, ptr, rfbm, inuse, rfbm & inuse, xcomp_bv);
 }
 
 static void do_xrstor_fpu(X86Access *ac, target_ulong ptr)
@@ -3160,7 +3238,7 @@ void cpu_x86_xsave(CPUX86State *env, void *host, size_t len, uint64_t rfbm)
     assert((rfbm & ~env->xcr0) == 0);
     ac.size = xsave_area_size(rfbm, false);
     assert(ac.size <= len);
-    do_xsave_access(&ac, 0, rfbm, get_xinuse(env), rfbm);
+    do_xsave_access(&ac, 0, rfbm, get_xinuse(env), rfbm, 0);
 }
 
 bool cpu_x86_xrstor(CPUX86State *env, void *host, size_t len, uint64_t rfbm)
