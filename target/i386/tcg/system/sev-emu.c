@@ -75,7 +75,7 @@ bool sev_emu_msr_passthrough(uint32_t index)
 static int sev_snp_emu_psc(CPUX86State *env, hwaddr gpa, unsigned op,
                            bool huge);
 static void sev_emu_nae_psc(CPUX86State *env, hwaddr ghcb_gpa, GhcbPage *ghcb);
-static bool ghcb_scratch(hwaddr ghcb_gpa, GhcbPage *ghcb, unsigned size,
+static bool ghcb_scratch(hwaddr ghcb_gpa, GhcbPage *ghcb, uint64_t size,
                          void *buf, bool to_guest);
 
 /* ---- the GHCB page in guest memory ---- */
@@ -491,28 +491,47 @@ static bool ghcb_inputs_valid(const GhcbPage *ghcb, uint64_t exit_code)
     }
 }
 
-/* the scratch area: inside the GHCB's shared buffer, or a page of its own */
-static bool ghcb_scratch(hwaddr ghcb_gpa, GhcbPage *ghcb, unsigned size,
-                         void *buf, bool to_guest)
+/* the largest scratch area outside the GHCB, KVM's GHCB_SCRATCH_AREA_LIMIT */
+#define GHCB_SCRATCH_LIMIT  (16 * 4096)
+
+/*
+ * The scratch area of `size` bytes, checked as KVM's setup_vmgexit_scratch()
+ * does: when it begins in the GHCB page it must lie in the shared buffer,
+ * elsewhere it may be up to GHCB_SCRATCH_LIMIT bytes long.
+ */
+static bool ghcb_scratch_valid(hwaddr ghcb_gpa, const GhcbPage *ghcb,
+                               uint64_t size)
 {
     hwaddr scratch = ghcb->sw_scratch;
     hwaddr buf_start = ghcb_gpa + offsetof(GhcbPage, shared_buffer);
     hwaddr buf_end = buf_start + sizeof(ghcb->shared_buffer);
 
-    if (scratch >= buf_start && scratch + size <= buf_end) {
-        uint8_t *p = ghcb->shared_buffer + (scratch - buf_start);
+    if (!scratch || scratch + size < scratch) {
+        return false;
+    }
+    if ((scratch & ~0xfffULL) == ghcb_gpa) {
+        return scratch >= buf_start && scratch + size <= buf_end;
+    }
+    return size <= GHCB_SCRATCH_LIMIT;
+}
+
+/* copy `size` bytes from or to the scratch area; false if it is invalid */
+static bool ghcb_scratch(hwaddr ghcb_gpa, GhcbPage *ghcb, uint64_t size,
+                         void *buf, bool to_guest)
+{
+    hwaddr scratch = ghcb->sw_scratch;
+
+    if (!ghcb_scratch_valid(ghcb_gpa, ghcb, size)) {
+        return false;
+    }
+    if ((scratch & ~0xfffULL) == ghcb_gpa) {
+        uint8_t *p = (uint8_t *)ghcb + (scratch - ghcb_gpa);
         if (to_guest) {
             memcpy(p, buf, size);
         } else {
             memcpy(buf, p, size);
         }
         return true;
-    }
-    if (scratch >= ghcb_gpa && scratch < ghcb_gpa + sizeof(*ghcb)) {
-        return false;    /* inside the GHCB but outside the shared buffer */
-    }
-    if (scratch & 0xfff ? (scratch & 0xfff) + size > 0x1000 : size > 0x1000) {
-        return false;    /* must not cross a page */
     }
     if (to_guest) {
         address_space_write(&address_space_memory, scratch,
@@ -524,49 +543,105 @@ static bool ghcb_scratch(hwaddr ghcb_gpa, GhcbPage *ghcb, unsigned size,
     return true;
 }
 
-static void sev_emu_nae_ioio(CPUX86State *env, GhcbPage *ghcb)
+static uint32_t sev_emu_io_in(uint16_t port, unsigned size)
+{
+    MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+
+    switch (size) {
+    case 1:
+        return address_space_ldub(&address_space_io, port, attrs, NULL);
+    case 2:
+        return address_space_lduw_le(&address_space_io, port, attrs, NULL);
+    default:
+        return address_space_ldl_le(&address_space_io, port, attrs, NULL);
+    }
+}
+
+static void sev_emu_io_out(uint16_t port, unsigned size, uint32_t value)
+{
+    MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+
+    switch (size) {
+    case 1:
+        address_space_stb(&address_space_io, port, value, attrs, NULL);
+        break;
+    case 2:
+        address_space_stw_le(&address_space_io, port, value, attrs, NULL);
+        break;
+    default:
+        address_space_stl_le(&address_space_io, port, value, attrs, NULL);
+        break;
+    }
+}
+
+/*
+ * String I/O (INS, OUTS): sw_exit_info_2 elements of `size` bytes go
+ * through the scratch area, in order, as in KVM's sev_es_string_io(). The
+ * guest's #VC handler copies between the scratch area and the memory
+ * operand and applies the direction flag; the hypervisor does not.
+ */
+static void sev_emu_nae_string_io(hwaddr ghcb_gpa, GhcbPage *ghcb,
+                                  uint16_t port, unsigned size, bool in)
+{
+    uint64_t count = ghcb->sw_exit_info_2;
+    uint64_t bytes = count * size;
+    g_autofree uint8_t *buf = NULL;
+
+    if (count > INT32_MAX || bytes > INT32_MAX) {
+        /* KVM fails the vCPU run (-EINVAL) */
+        qemu_log_mask(LOG_GUEST_ERROR, "sev-emu: string IOIO of %" PRIu64
+                      " elements\n", count);
+        ghcb_malformed(ghcb, GHCB_ERR_INVALID_INPUT);
+        return;
+    }
+    if (!bytes) {
+        ghcb_result(ghcb, GHCB_RESULT_OK, 0);
+        return;
+    }
+    if (!ghcb_scratch_valid(ghcb_gpa, ghcb, bytes)) {
+        ghcb_malformed(ghcb, GHCB_ERR_INVALID_SCRATCH);
+        return;
+    }
+    buf = g_malloc(bytes);
+    if (in) {
+        for (uint64_t i = 0; i < count; i++) {
+            stn_le_p(buf + i * size, size, sev_emu_io_in(port, size));
+        }
+        ghcb_scratch(ghcb_gpa, ghcb, bytes, buf, true);
+    } else {
+        ghcb_scratch(ghcb_gpa, ghcb, bytes, buf, false);
+        for (uint64_t i = 0; i < count; i++) {
+            sev_emu_io_out(port, size, ldn_le_p(buf + i * size, size));
+        }
+    }
+    ghcb_result(ghcb, GHCB_RESULT_OK, 0);
+}
+
+static void sev_emu_nae_ioio(hwaddr ghcb_gpa, GhcbPage *ghcb)
 {
     uint64_t info = ghcb->sw_exit_info_1;
     uint16_t port = info >> 16;
     unsigned size = info & IOIO_DATA_8 ? 1 :
-                    info & IOIO_DATA_16 ? 2 : 4;
-    MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+                    info & IOIO_DATA_16 ? 2 :
+                    info & IOIO_DATA_32 ? 4 : 0;
 
+    if (!size) {
+        /* no operand size: nothing to do, as in KVM */
+        ghcb_result(ghcb, GHCB_RESULT_OK, 0);
+        return;
+    }
     if (info & IOIO_TYPE_STR) {
-        /* string I/O through the scratch area is not used by the guests we run */
-        qemu_log_mask(LOG_UNIMP, "sev-emu: string IOIO\n");
-        ghcb_malformed(ghcb, GHCB_ERR_INVALID_INPUT);
+        sev_emu_nae_string_io(ghcb_gpa, ghcb, port, size, info & IOIO_TYPE_IN);
         return;
     }
     if (info & IOIO_TYPE_IN) {
-        uint32_t value;
-        switch (size) {
-        case 1:
-            value = address_space_ldub(&address_space_io, port, attrs, NULL);
-            break;
-        case 2:
-            value = address_space_lduw_le(&address_space_io, port, attrs, NULL);
-            break;
-        default:
-            value = address_space_ldl_le(&address_space_io, port, attrs, NULL);
-            break;
-        }
+        uint32_t value = sev_emu_io_in(port, size);
+
         /* the upper bits of RAX are preserved, the result is not sign-extended */
         GHCB_SET(ghcb, rax,
                  (ghcb->rax & ~((1ULL << (size * 8)) - 1)) | value);
     } else {
-        uint32_t value = ghcb->rax;
-        switch (size) {
-        case 1:
-            address_space_stb(&address_space_io, port, value, attrs, NULL);
-            break;
-        case 2:
-            address_space_stw_le(&address_space_io, port, value, attrs, NULL);
-            break;
-        default:
-            address_space_stl_le(&address_space_io, port, value, attrs, NULL);
-            break;
-        }
+        sev_emu_io_out(port, size, ghcb->rax);
     }
     ghcb_result(ghcb, GHCB_RESULT_OK, 0);
 }
@@ -671,7 +746,7 @@ static void sev_emu_vmgexit_ghcb(CPUX86State *env, hwaddr gpa,
         sev_emu_nae_msr(env, ghcb);
         break;
     case SVM_EXIT_IOIO:
-        sev_emu_nae_ioio(env, ghcb);
+        sev_emu_nae_ioio(gpa, ghcb);
         break;
     case SVM_EXIT_RDTSC:
     case SVM_EXIT_RDTSCP: {
