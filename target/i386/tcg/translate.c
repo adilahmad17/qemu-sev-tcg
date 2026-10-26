@@ -2996,14 +2996,17 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
             break;
 #endif
         case 0xd9: /* VMMCALL */
-            if (!SVME(s)) {
-                goto illegal_op;
-            }
-            gen_update_cc_op(s);
-            gen_update_eip_cur(s);
 #if defined(CONFIG_SEV) && !defined(CONFIG_USER_ONLY)
+            /*
+             * Both are intercepted in an SEV-ES guest, which always runs
+             * with EFER.SVME set (the VMSA carries it, VMRUN requires it):
+             * no #UD for EFER.SVME = 0, which the emulated guest can have
+             * when it starts from the reset state (-bios).
+             */
             if (sev_es_emu_active()) {
-                if (s->prefix & PREFIX_REPZ) {
+                gen_update_cc_op(s);
+                gen_update_eip_cur(s);
+                if (s->prefix & (PREFIX_REPZ | PREFIX_REPNZ)) {
                     /* VMGEXIT: the GHCB MSR or page goes to the hypervisor */
                     gen_helper_sev_vmgexit(tcg_env, cur_insn_len_i32(s));
                     s->base.is_jmp = DISAS_EOB_NEXT;
@@ -3013,6 +3016,11 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
                 break;
             }
 #endif
+            if (!SVME(s)) {
+                goto illegal_op;
+            }
+            gen_update_cc_op(s);
+            gen_update_eip_cur(s);
             gen_helper_vmmcall(tcg_env);
             break;
 
