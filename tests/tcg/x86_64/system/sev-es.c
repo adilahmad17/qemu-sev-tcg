@@ -462,7 +462,39 @@ struct idt_entry {
     uint32_t off2, rsvd;
 } __attribute__((packed));
 
-static struct idt_entry idt[32] __attribute__((aligned(16)));
+#define TIMER_VECTOR 0x40
+
+static struct idt_entry idt[TIMER_VECTOR + 1] __attribute__((aligned(16)));
+
+static volatile unsigned timer_ticks;  /* set by the interrupt handler */
+
+#define MSR_X2APIC_EOI          0x80b
+#define MSR_X2APIC_SVR          0x80f
+#define MSR_X2APIC_LVT_TIMER    0x832
+#define MSR_X2APIC_TIMER_ICR    0x838
+#define MSR_X2APIC_TIMER_DCR    0x83e
+
+/* called by name from timer_entry */
+static void __attribute__((used)) timer_handler_c(void)
+{
+    timer_ticks++;
+    wrmsr(MSR_X2APIC_EOI, 0);
+}
+
+/* the APIC timer interrupt: count and EOI */
+static __attribute__((naked)) void timer_entry(void)
+{
+    asm volatile(
+        "push %rax\n    push %rcx\n    push %rdx\n    push %rbx\n    push %rsi\n"
+        "push %rdi\n    push %r8\n    push %r9\n    push %r10\n    push %r11\n"
+        "mov %rsp, %rbx\n"
+        "and $-16, %rsp\n"
+        "call timer_handler_c\n"
+        "mov %rbx, %rsp\n"
+        "pop %r11\n    pop %r10\n    pop %r9\n    pop %r8\n    pop %rdi\n"
+        "pop %rsi\n    pop %rbx\n    pop %rdx\n    pop %rcx\n    pop %rax\n"
+        "iretq\n");
+}
 
 static void set_gate(int vec, void (*fn)(void))
 {
@@ -485,6 +517,7 @@ static void idt_init(void)
         set_gate(v, fault_entry);
     }
     set_gate(29, vc_entry);
+    set_gate(TIMER_VECTOR, timer_entry);
     asm volatile("lidt %0" : : "m"(idtr));
 }
 
@@ -1021,9 +1054,23 @@ int main(void)
     g->ghcb_usage = 0;
 
     /* intercepted instructions */
-    before = vc_counts[4];
-    asm volatile("hlt");
-    CHECK(vc_counts[4] == before + 1, "HLT raised #VC");
+    /*
+     * HLT is an automatic exit, not a #VC: the vCPU halts until an interrupt,
+     * here a one-shot x2APIC timer interrupt.
+     */
+    {
+        unsigned ticks = timer_ticks;
+        before = vc_counts[4];
+        wrmsr(MSR_APIC_BASE, rdmsr(MSR_APIC_BASE) | (1 << 10));
+        wrmsr(MSR_X2APIC_SVR, 0x1ff);
+        wrmsr(MSR_X2APIC_TIMER_DCR, 0xb);
+        wrmsr(MSR_X2APIC_LVT_TIMER, TIMER_VECTOR);
+        wrmsr(MSR_X2APIC_TIMER_ICR, 1000000);
+        asm volatile("sti\n\thlt\n\tcli" : : : "memory");
+        wrmsr(MSR_X2APIC_LVT_TIMER, 1 << 16);
+        CHECK(vc_counts[4] == before && timer_ticks == ticks + 1,
+              "HLT halts without #VC until the timer interrupt");
+    }
     before = vc_counts[5];
     asm volatile("wbinvd");
     CHECK(vc_counts[5] == before + 1, "WBINVD raised #VC and the event succeeded");

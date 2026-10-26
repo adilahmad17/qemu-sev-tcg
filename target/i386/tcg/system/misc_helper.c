@@ -598,11 +598,10 @@ G_NORETURN void helper_hlt(CPUX86State *env)
 {
     CPUState *cs = env_cpu(env);
 
-#ifdef CONFIG_SEV
-    if (sev_es_emu_active()) {
-        sev_emu_raise_vc(env, SVM_EXIT_HLT, GETPC());
-    }
-#endif
+    /*
+     * No #VC in an SEV-ES guest: HLT is an automatic exit (APM vol. 2,
+     * table 15-35), the hypervisor halts the vCPU as for any guest.
+     */
     do_end_instruction(env);
     cs->halted = 1;
     cs->exception_index = EXCP_HLT;
