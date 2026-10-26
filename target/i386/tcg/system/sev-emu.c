@@ -627,13 +627,11 @@ static void sev_emu_vmgexit_ghcb(CPUX86State *env, hwaddr gpa,
 
     ghcb_read(gpa, ghcb);
 
-    if (ghcb->protocol_version < GHCB_PROTOCOL_MIN ||
-        ghcb->protocol_version > GHCB_PROTOCOL_MAX) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "sev-emu: GHCB protocol version %u not supported\n",
-                      ghcb->protocol_version);
-        goto terminate;
-    }
+    /*
+     * The protocol version field of the page is not checked, as in KVM:
+     * the version is negotiated with the MSR protocol, and OVMF leaves
+     * the field 0.
+     */
     reason = ghcb_inputs_check(ghcb);
     if (reason) {
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -801,12 +799,6 @@ out:
     if (halt) {
         sev_emu_halt(env, next_eip_addend);
     }
-    return;
-
-terminate:
-    g_free(ghcb);
-    sev_emu_terminate(0, 0);
-    sev_emu_halt(env, next_eip_addend);
 }
 
 /* REP VMMCALL: the guest hands the hypervisor its GHCB MSR or GHCB page */
