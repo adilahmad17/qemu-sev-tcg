@@ -1009,9 +1009,9 @@ void x86_cpu_vendor_words2str(char *dst, uint32_t vendor1,
 #define TCG_7_2_EDX_FEATURES 0
 #define TCG_APM_FEATURES 0
 #define TCG_6_EAX_FEATURES CPUID_6_EAX_ARAT
-#define TCG_XSAVE_FEATURES (CPUID_XSAVE_XSAVEOPT | CPUID_XSAVE_XGETBV1)
-          /* missing:
-          CPUID_XSAVE_XSAVEC, CPUID_XSAVE_XSAVES */
+#define TCG_XSAVE_FEATURES (CPUID_XSAVE_XSAVEOPT | CPUID_XSAVE_XSAVEC | \
+          CPUID_XSAVE_XGETBV1)
+          /* missing: CPUID_XSAVE_XSAVES */
 #define TCG_14_0_ECX_FEATURES 0
 #define TCG_SGX_12_0_EAX_FEATURES 0
 #define TCG_SGX_12_0_EBX_FEATURES 0
@@ -8917,7 +8917,16 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
                               x86_cpu_xsave_xss_components(cpu);
 
             *eax = env->features[FEAT_XSAVE];
-            *ebx = xsave_area_size(xstate, true);
+            /*
+             * EBX is the size of the compacted XSAVE area for the state
+             * components enabled in XCR0 and IA32_XSS.  With TCG, take it
+             * from their current values, as for EBX of subleaf 0.
+             */
+            if (tcg_enabled()) {
+                *ebx = xsave_area_size(env->xcr0 | env->xss, true);
+            } else {
+                *ebx = xsave_area_size(xstate, true);
+            }
             *ecx = env->features[FEAT_XSAVE_XSS_LO];
             *edx = env->features[FEAT_XSAVE_XSS_HI];
         } else if (count < ARRAY_SIZE(x86_ext_save_areas)) {
