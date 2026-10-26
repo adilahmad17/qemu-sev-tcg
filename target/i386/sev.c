@@ -1013,8 +1013,20 @@ uint64_t sev_emu_hv_features(void)
 
 static void sev_emu_ap_create_work(CPUState *cs, run_on_cpu_data data)
 {
+    CPUX86State *env = &X86_CPU(cs)->env;
+    /*
+     * The GHCB MSR and the registered GHCB are in the VMCB control area, not
+     * in the VMSA: the vCPU keeps them with its new VMSA, as in KVM. (OVMF
+     * relies on it: an AP it starts again goes to its C code without
+     * setting up its GHCB again.)
+     */
+    uint64_t ghcb_msr = env->sev_ghcb_msr;
+    uint64_t ghcb_registered_gpa = env->sev_ghcb_registered_gpa;
+
     /* the reset applies the recorded VMSA (sev_es_set_reset_vector) */
     cpu_reset(cs);
+    env->sev_ghcb_msr = ghcb_msr;
+    env->sev_ghcb_registered_gpa = ghcb_registered_gpa;
     cpu_reset_interrupt(cs, CPU_INTERRUPT_INIT | CPU_INTERRUPT_SIPI);
     cs->halted = 0;
 }

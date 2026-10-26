@@ -766,6 +766,23 @@ static const struct snp_cpuid_fn *cpuid_page_find(uint32_t leaf, uint32_t sub)
 static uint8_t snp_pages[4 * 4096] __attribute__((aligned(4096)));
 static uint8_t snp_vmsa[3 * 4096] __attribute__((aligned(4096)));
 
+/*
+ * An AP started again from a VMSA keeps its GHCB MSR (the VMCB holds it,
+ * not the VMSA): note the value found, then leave a mark for the next start.
+ */
+#define AP_GHCB_MARK        0x3fd000ULL
+static volatile uint64_t ap_ghcb_seen;   /* set by the other vCPU */
+
+static void ap_entry_ghcb(void)
+{
+    ap_ghcb_seen = rdmsr(MSR_GHCB);
+    wrmsr(MSR_GHCB, AP_GHCB_MARK);
+    ap_started = 1;
+    for (;;) {
+        asm volatile("pause");
+    }
+}
+
 static uint64_t psc_msr(void *va, unsigned op)
 {
     return ghcb_msr_protocol(GHCB_MSR_PSC_REQ | ((uint64_t)va & 0x000ffffffffff000ULL) |
@@ -963,6 +980,22 @@ int main(void)
             asm volatile("pause");
         }
         CHECK(ap_started, "AP started from the SNP VMSA");
+
+        /* twice more: the second start finds the mark of the first */
+        *(uint64_t *)(vmsa + 0x178) = (uint64_t)ap_entry_ghcb;
+        for (int n = 0; n < 2; n++) {
+            ap_started = 0;
+            ghcb_clear(g);
+            GHCB_SET(g, rax, 1);
+            ghcb_call(g, SVM_VMGEXIT_AP_CREATION, (1ULL << 32) | 1,
+                      (uint64_t)vmsa);
+            for (int i = 0; i < 100000000 && !ap_started; i++) {
+                asm volatile("pause");
+            }
+        }
+        CHECK(ap_started && ap_ghcb_seen == AP_GHCB_MARK,
+              "AP started again keeps its GHCB MSR (%" PRIx64 ")",
+              ap_ghcb_seen);
     }
 
     ml_printf("#VC counts: cpuid %u msr %u ioio %u page-not-validated %u unexpected %u (last %" PRIx64 ")\n",
